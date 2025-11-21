@@ -310,7 +310,7 @@ class AsyncContextRAG:
         query_vec = list(self.embed_model.embed([user_query]))[0].tolist()
         
         # 2. Search
-        search_results = await self.client.search_points(
+        search_results = await self.client.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_vec,
             limit=25
