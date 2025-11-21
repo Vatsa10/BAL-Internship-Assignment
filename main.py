@@ -5,6 +5,8 @@ import re
 import fitz  # PyMuPDF
 import cv2
 import numpy as np
+import requests
+import gradio as gr
 from typing import List, Dict, Any, Tuple
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -20,20 +22,19 @@ from paddleocr import PaddleOCR
 GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"  
 
 # Qdrant Cloud / API Configuration
-# Get these from https://cloud.qdrant.io/
 QDRANT_URL = "https://your-cluster-url.qdrant.io:6333" 
 QDRANT_API_KEY = "YOUR_QDRANT_API_KEY_HERE"
 
-COLLECTION_NAME = "imf_policy_reports_v1" # Specialized Collection
+COLLECTION_NAME = "imf_policy_reports_v1" 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
-# Chunking Settings (Optimized for dense policy paragraphs)
-WINDOW_SIZE = 6  # Increased for longer financial sentences
+# Chunking Settings 
+WINDOW_SIZE = 6  
 WINDOW_OVERLAP = 2
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- 1. CPU-BOUND HELPER FUNCTIONS ---
+# --- 1. HELPER FUNCTIONS ---
 
 def _run_paddle_ocr(image_bytes: bytes) -> str:
     """Runs PaddleOCR on an image byte stream."""
@@ -48,34 +49,27 @@ def _run_paddle_ocr(image_bytes: bytes) -> str:
     return "\n".join(extracted_text)
 
 def _create_sentence_window_chunks(text: str, page_num: int) -> List[Dict]:
-    """
-    Splits text into sentences and creates overlapping windows.
-    Strategy: Context-Aware Sliding Window for Policy Documents.
-    """
-    # 1. Split into sentences (Regex handles Dr., Mr., etc. better)
+    """Splits text into sentences and creates overlapping windows."""
     sentences = re.split(r'(?<=[.!?])\s+', text)
     sentences = [s.strip() for s in sentences if len(s) > 10] 
     
-    chunks = []
-    num_sentences = len(sentences)
+    if not sentences: return []
     
-    if num_sentences == 0: return []
-    
-    if num_sentences <= WINDOW_SIZE:
+    if len(sentences) <= WINDOW_SIZE:
         return [{
             "text": f"Page {page_num} Policy Text: {text}",
             "type": "text_window",
-            "metadata": {"window_span": f"0-{num_sentences}"}
+            "metadata": {"window_span": f"0-{len(sentences)}"}
         }]
 
+    chunks = []
     step = WINDOW_SIZE - WINDOW_OVERLAP
-    for i in range(0, num_sentences, step):
+    for i in range(0, len(sentences), step):
         window = sentences[i : i + WINDOW_SIZE]
         chunk_text = " ".join(window)
         
         if len(chunk_text) < 50: continue 
         
-        # Context Injection: Adds "Policy Text" context for embedding model
         context_aware_text = f"Page {page_num} Policy Text: {chunk_text}"
         
         chunks.append({
@@ -87,15 +81,13 @@ def _create_sentence_window_chunks(text: str, page_num: int) -> List[Dict]:
             }
         })
         
-        if i + WINDOW_SIZE >= num_sentences:
+        if i + WINDOW_SIZE >= len(sentences):
             break
             
     return chunks
 
 def _cpu_process_page_context_aware(pdf_path: str, page_num: int) -> Dict[str, Any]:
-    """
-    Processes a page using Table Extraction + Sentence Window Chunking.
-    """
+    """Processes a page using Table Extraction + Sentence Window Chunking."""
     doc = fitz.open(pdf_path)
     page = doc.load_page(page_num)
     
@@ -106,7 +98,7 @@ def _cpu_process_page_context_aware(pdf_path: str, page_num: int) -> Dict[str, A
         "needs_ocr": False
     }
 
-    # --- A. TABLE EXTRACTION (Critical for IMF Macro Data) ---
+    # A. TABLE EXTRACTION 
     tables = page.find_tables()
     if tables.tables:
         for tab in tables:
@@ -117,23 +109,19 @@ def _cpu_process_page_context_aware(pdf_path: str, page_num: int) -> Dict[str, A
                     "type": "table",
                     "metadata": {"source": "imf_table"}
                 })
-            # Mask table to avoid duplicate text processing
             page.add_redact_annot(tab.bbox)
         page.apply_redactions()
 
-    # --- B. IMAGE EXTRACTION (Charts/Fan Charts) ---
+    # B. IMAGE EXTRACTION
     image_list = page.get_images(full=True)
     for img in image_list:
         xref = img[0]
         base_image = doc.extract_image(xref)
-        # Filter tiny icons, keep charts
         if len(base_image["image"]) > 5000: 
             result_data["images"].append(base_image["image"])
 
-    # --- C. CONTEXT-AWARE TEXT CHUNKING ---
+    # C. TEXT CHUNKING
     text_content = page.get_text()
-    
-    # Check for Scans
     if len(text_content) < 50:
         result_data["needs_ocr"] = True
         pix = page.get_pixmap()
@@ -150,13 +138,7 @@ def _cpu_process_page_context_aware(pdf_path: str, page_num: int) -> Dict[str, A
 class AsyncContextRAG:
     def __init__(self):
         self.process_executor = ProcessPoolExecutor(max_workers=os.cpu_count())
-        
-        # Initialize Client with API Key for Cloud Support
-        self.client = AsyncQdrantClient(
-            url=QDRANT_URL,
-            api_key=QDRANT_API_KEY, 
-        )
-        
+        self.client = AsyncQdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
         self.embed_model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
         self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 
@@ -168,36 +150,26 @@ class AsyncContextRAG:
             )
 
     async def analyze_image(self, image_bytes: bytes) -> str:
-        """
-        Specialized VLM Prompt for Finance/IMF Charts.
-        """
         try:
             from PIL import Image
             img = Image.open(io.BytesIO(image_bytes))
-            
-            # Domain-Specific Prompt
-            prompt = """
-            Analyze this image from an IMF/Financial Policy report.
-            1. If it is a Chart/Graph: Extract key trends for GDP, Inflation, or Debt. Identify the time horizon (e.g., 2020-2028).
-            2. If it is a Fan Chart (Risk): Describe the uncertainty bands.
-            3. If it is a Heatmap: Identify the red/warning sectors.
-            Provide a concise summary of the economic signal.
-            """
+            prompt = "Analyze this image from an IMF/Financial Policy report. Identify charts, trends, fan charts, or heatmaps. Summarize the economic signal."
             response = await self.gemini_model.generate_content_async([prompt, img])
             return response.text
         except Exception:
             return "Chart analysis unavailable."
 
-    async def ingest_document(self, pdf_path: str):
-        if not os.path.exists(pdf_path): return
+    async def ingest_document(self, pdf_path: str, progress=gr.Progress()):
+        if not os.path.exists(pdf_path): return "Error: File not found."
+        
         doc = fitz.open(pdf_path)
         total_pages = len(doc)
         doc.close()
-        print(f"🚀 Ingesting Financial Doc {pdf_path} ({total_pages} pages)...")
-
+        
+        progress(0, desc=f"Starting ingestion for {total_pages} pages...")
         loop = asyncio.get_running_loop()
         
-        # 1. Parallel Processing
+        # 1. Parsing
         tasks = [
             loop.run_in_executor(self.process_executor, _cpu_process_page_context_aware, pdf_path, i)
             for i in range(total_pages)
@@ -208,19 +180,19 @@ class AsyncContextRAG:
         points_to_upsert = []
         import uuid
 
-        for page_data in raw_pages:
+        for i, page_data in enumerate(raw_pages):
+            progress((i / total_pages), desc=f"Enriching Page {i+1} (OCR/Vision)...")
             page_num = page_data["page_num"]
             
-            # OCR Fallback
+            # OCR
             if page_data["needs_ocr"]:
-                print(f"   Page {page_num}: OCR active (Scanned Page)...")
                 ocr_text = await loop.run_in_executor(
                     self.process_executor, _run_paddle_ocr, page_data["scan_bytes"]
                 )
                 ocr_chunks = _create_sentence_window_chunks(ocr_text, page_num)
                 page_data["chunks"].extend(ocr_chunks)
 
-            # Image Analysis
+            # Vision
             if page_data["images"]:
                 img_tasks = [self.analyze_image(b) for b in page_data["images"]]
                 captions = await asyncio.gather(*img_tasks)
@@ -233,14 +205,13 @@ class AsyncContextRAG:
 
             if not page_data["chunks"]: continue
 
-            # Embed & Create Points
             texts = [c["text"] for c in page_data["chunks"]]
             embeddings = list(self.embed_model.embed(texts))
 
-            for i, chunk in enumerate(page_data["chunks"]):
+            for idx, chunk in enumerate(page_data["chunks"]):
                 points_to_upsert.append(PointStruct(
                     id=str(uuid.uuid4()),
-                    vector=embeddings[i].tolist(),
+                    vector=embeddings[idx].tolist(),
                     payload={
                         "text": chunk["text"],
                         "type": chunk["type"],
@@ -249,7 +220,6 @@ class AsyncContextRAG:
                     }
                 ))
 
-        # Batch Upsert
         if points_to_upsert:
             batch_size = 100
             for i in range(0, len(points_to_upsert), batch_size):
@@ -257,16 +227,17 @@ class AsyncContextRAG:
                     collection_name=COLLECTION_NAME,
                     points=points_to_upsert[i:i+batch_size]
                 )
-            print(f"✅ Indexing Complete: {len(points_to_upsert)} vectors stored.")
+            return f"✅ Success! Indexed {len(points_to_upsert)} chunks from {total_pages} pages."
+        else:
+            return "⚠️ No indexable content found."
 
     async def query(self, user_query: str):
         query_vec = list(self.embed_model.embed([user_query]))[0].tolist()
         
-        # Retrieve more chunks for context-heavy financial questions
         search_results = await self.client.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_vec,
-            limit=10  # Increased limit for comprehensive policy answers
+            limit=10
         )
 
         context_str = ""
@@ -274,19 +245,11 @@ class AsyncContextRAG:
         for hit in search_results:
             meta = hit.payload
             citations.append(f"Page {meta['page']}")
-            # Explicitly tag the source type for the LLM
             context_str += f"\n[Source: Page {meta['page']} | Type: {meta['type']}]\n{meta['text']}\n"
 
-        # Specialized Policy Analyst Persona
         prompt = f"""
-        You are an expert economic policy analyst specializing in IMF Article IV reports and financial documents.
-        Answer the user's question using *only* the provided context chunks.
-
-        GUIDELINES:
-        1. **Data Accuracy**: If specific numbers (GDP %, Deficit, etc.) are in the text/tables, quote them exactly.
-        2. **Policy Nuance**: Distinguish between "Staff Projections" and "Authorities' Views" if mentioned.
-        3. **Citations**: Explicitly cite the source type and page (e.g., "[Source: Page 4 | Table]").
-        4. **Uncertainty**: If the report mentions risks (downside risks, shocks), highlight them.
+        You are an expert economic policy analyst. Answer using ONLY the context.
+        Cite sources (e.g., [Source: Page 4]). If data is missing, state "Data not found."
 
         CONTEXT:
         {context_str}
@@ -298,26 +261,85 @@ class AsyncContextRAG:
         response = await self.gemini_model.generate_content_async(prompt)
         return response.text, list(set(citations))
 
-# --- EXECUTION ---
-async def main():
-    rag = AsyncContextRAG()
-    await rag.initialize_db()
+# --- 3. GRADIO INTERFACE LOGIC ---
+
+rag_system = AsyncContextRAG()
+
+async def handle_ingest(file_obj, url_text):
+    # Initialize DB first
+    await rag_system.initialize_db()
     
-    pdf_file = "imf_report.pdf" # <--- CHANGE THIS to your Article IV PDF
-    if os.path.exists(pdf_file):
-        choice = input(f"Found {pdf_file}. Do you want to Index/Ingest it? (y/n): ")
-        if choice.lower().strip() == 'y':
-            await rag.ingest_document(pdf_file)
+    target_path = ""
+    
+    # Scenario A: URL provided
+    if url_text and url_text.strip():
+        try:
+            response = requests.get(url_text)
+            if response.status_code == 200:
+                filename = "downloaded_report.pdf"
+                with open(filename, 'wb') as f:
+                    f.write(response.content)
+                target_path = filename
+            else:
+                return f"❌ Error downloading URL: Status {response.status_code}"
+        except Exception as e:
+            return f"❌ Error downloading URL: {str(e)}"
+            
+    # Scenario B: File Uploaded
+    elif file_obj is not None:
+        target_path = file_obj.name
+    
     else:
-        print(f"PDF {pdf_file} not found.")
+        return "⚠️ Please upload a file or provide a URL."
+
+    return await rag_system.ingest_document(target_path)
+
+async def chat_response(message, history):
+    # History format: [[user_msg, bot_msg], ...]
+    # We don't necessarily need history for the RAG search context unless we build a conversational memory.
+    # For now, strictly RAG based on current query.
+    
+    answer, citations = await rag_system.query(message)
+    
+    # Format citations
+    citation_str = "\n\n📚 **Sources:** " + ", ".join(citations) if citations else ""
+    final_response = answer + citation_str
+    
+    return final_response
+
+# --- 4. UI BUILDER ---
+
+with gr.Blocks(title="Financial Policy Analyst RAG", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 📈 Financial Policy Analyst RAG")
+    gr.Markdown("Async, Multi-Modal (Text + Tables + Charts) analysis of IMF & Finance Reports.")
+
+    with gr.Accordion("📂 Knowledge Base Ingestion", open=True):
+        with gr.Row():
+            file_input = gr.File(label="Upload PDF Report", file_types=[".pdf"])
+            url_input = gr.Textbox(label="OR Enter PDF URL", placeholder="https://www.imf.org/.../report.pdf")
         
-    print("\nPolicy Analyst Bot Ready. Ask about GDP, Debt, or Structural Reforms.")
-    while True:
-        q = input("\nQuery: ")
-        if q == "exit": break
-        ans, sources = await rag.query(q)
-        print(f"AI: {ans}\nSources: {sources}")
+        ingest_btn = gr.Button("🚀 Ingest Document", variant="primary")
+        ingest_status = gr.Textbox(label="Status", interactive=False)
+
+    with gr.Row():
+        chatbot = gr.ChatInterface(
+            fn=chat_response,
+            title="💬 Policy Analyst Chat",
+            description="Ask about GDP projections, debt sustainability, or specific charts.",
+            examples=["What are the downside risks to growth?", "Summarize the debt sustainability analysis.", "What does the fan chart indicate about inflation?"],
+        )
+
+    # Event Handlers
+    ingest_btn.click(
+        fn=handle_ingest, 
+        inputs=[file_input, url_input], 
+        outputs=[ingest_status]
+    )
+
+# --- 5. LAUNCH ---
 
 if __name__ == "__main__":
-    if os.name == 'nt': asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    # Ensure DB is ready before starting? 
+    # In async Gradio, we can init strictly inside the event loop, 
+    # but running this wrapper ensures the loop is handled by Gradio.
+    demo.launch()
