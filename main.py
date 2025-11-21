@@ -18,22 +18,20 @@ from qdrant_client.models import PointStruct, VectorParams, Distance
 from fastembed import TextEmbedding
 import google.generativeai as genai
 from paddleocr import PaddleOCR
+# pip install flashrank
+from flashrank import Ranker, RerankRequest
 
 # --- CONFIGURATION ---
-# Load environment variables from .env file
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-# Validation
 if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in .env file")
-if not QDRANT_URL:
-    raise ValueError("QDRANT_URL not found in .env file")
+    raise ValueError("❌ GEMINI_API_KEY not found in .env file")
 
-COLLECTION_NAME = "imf_policy_reports_v1" 
+COLLECTION_NAME = "imf_policy_reports_opt_v2" 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 # Chunking Settings 
@@ -42,23 +40,31 @@ WINDOW_OVERLAP = 2
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- 1. HELPER FUNCTIONS ---
+# --- 1. HELPER FUNCTIONS (CPU BOUND) ---
 
 def _run_paddle_ocr(image_bytes: bytes) -> str:
     """Runs PaddleOCR on an image byte stream."""
-    # Using a lightweight CPU config for PaddleOCR
-    ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+    # FIX: Removed 'show_log=False' which caused the ValueError in newer PaddleOCR versions
+    ocr = PaddleOCR(use_angle_cls=True, lang='en') 
+    
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    # PaddleOCR might return None if no text found
     result = ocr.ocr(img, cls=True)
+    
     extracted_text = []
-    if result and result[0]:
+    if result and isinstance(result, list) and len(result) > 0 and result[0]:
         for line in result[0]:
-            extracted_text.append(line[1][0])
+            if line and len(line) > 1:
+                extracted_text.append(line[1][0])
+                
     return "\n".join(extracted_text)
 
 def _create_sentence_window_chunks(text: str, page_num: int) -> List[Dict]:
     """Splits text into sentences and creates overlapping windows."""
+    if not text: return []
+    
     sentences = re.split(r'(?<=[.!?])\s+', text)
     sentences = [s.strip() for s in sentences if len(s) > 10] 
     
@@ -97,52 +103,57 @@ def _create_sentence_window_chunks(text: str, page_num: int) -> List[Dict]:
 
 def _cpu_process_page_context_aware(pdf_path: str, page_num: int) -> Dict[str, Any]:
     """Processes a page using Table Extraction + Sentence Window Chunking."""
-    doc = fitz.open(pdf_path)
-    page = doc.load_page(page_num)
-    
-    result_data = {
-        "page_num": page_num,
-        "chunks": [],
-        "images": [],
-        "needs_ocr": False
-    }
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc.load_page(page_num)
+        
+        result_data = {
+            "page_num": page_num,
+            "chunks": [],
+            "images": [],
+            "needs_ocr": False
+        }
 
-    # A. TABLE EXTRACTION 
-    tables = page.find_tables()
-    if tables.tables:
-        for tab in tables:
-            md_text = tab.to_markdown()
-            if len(md_text) > 30:
-                result_data["chunks"].append({
-                    "text": f"Macroeconomic Table on Page {page_num}:\n{md_text}",
-                    "type": "table",
-                    "metadata": {"source": "imf_table"}
-                })
-            page.add_redact_annot(tab.bbox)
-        page.apply_redactions()
+        # A. TABLE EXTRACTION 
+        tables = page.find_tables()
+        if tables.tables:
+            for tab in tables:
+                md_text = tab.to_markdown()
+                if len(md_text) > 30:
+                    result_data["chunks"].append({
+                        "text": f"Macroeconomic Table on Page {page_num}:\n{md_text}",
+                        "type": "table",
+                        "metadata": {"source": "imf_table"}
+                    })
+                page.add_redact_annot(tab.bbox)
+            page.apply_redactions()
 
-    # B. IMAGE EXTRACTION
-    image_list = page.get_images(full=True)
-    for img in image_list:
-        xref = img[0]
-        base_image = doc.extract_image(xref)
-        if len(base_image["image"]) > 5000: 
-            result_data["images"].append(base_image["image"])
+        # B. IMAGE EXTRACTION
+        image_list = page.get_images(full=True)
+        for img in image_list:
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            if len(base_image["image"]) > 5000: 
+                result_data["images"].append(base_image["image"])
 
-    # C. TEXT CHUNKING
-    text_content = page.get_text()
-    if len(text_content) < 50:
-        result_data["needs_ocr"] = True
-        pix = page.get_pixmap()
-        result_data["scan_bytes"] = pix.tobytes("png")
-    else:
-        window_chunks = _create_sentence_window_chunks(text_content, page_num)
-        result_data["chunks"].extend(window_chunks)
+        # C. TEXT CHUNKING
+        text_content = page.get_text()
+        # Heuristic: If < 50 chars of text, assume scanned page
+        if len(text_content) < 50:
+            result_data["needs_ocr"] = True
+            pix = page.get_pixmap()
+            result_data["scan_bytes"] = pix.tobytes("png")
+        else:
+            window_chunks = _create_sentence_window_chunks(text_content, page_num)
+            result_data["chunks"].extend(window_chunks)
 
-    doc.close()
-    return result_data
+        doc.close()
+        return result_data
+    except Exception as e:
+        print(f"Error processing page {page_num}: {e}")
+        return {"page_num": page_num, "chunks": [], "images": [], "needs_ocr": False}
 
-# --- 2. ASYNC RAG PIPELINE ---
+# --- 2. ASYNC RAG PIPELINE (OPTIMIZED) ---
 
 class AsyncContextRAG:
     def __init__(self):
@@ -150,6 +161,13 @@ class AsyncContextRAG:
         self.client = AsyncQdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
         self.embed_model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
         self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+        
+        # Local Re-Ranker
+        self.reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="./flashrank_cache")
+        self.query_cache = {}
+        
+        # Semaphore to limit concurrent calls to Gemini API (prevents 429 errors)
+        self.sem = asyncio.Semaphore(8) 
 
     async def initialize_db(self):
         if not await self.client.collection_exists(COLLECTION_NAME):
@@ -159,14 +177,51 @@ class AsyncContextRAG:
             )
 
     async def analyze_image(self, image_bytes: bytes) -> str:
-        try:
-            from PIL import Image
-            img = Image.open(io.BytesIO(image_bytes))
-            prompt = "Analyze this image from an IMF/Financial Policy report. Identify charts, trends, fan charts, or heatmaps. Summarize the economic signal."
-            response = await self.gemini_model.generate_content_async([prompt, img])
-            return response.text
-        except Exception:
-            return "Chart analysis unavailable."
+        """Rate-limited image analysis"""
+        async with self.sem: # Wait for slot
+            try:
+                from PIL import Image
+                img = Image.open(io.BytesIO(image_bytes))
+                prompt = "Identify chart type, axes, and key trends. Be concise."
+                response = await self.gemini_model.generate_content_async([prompt, img])
+                return response.text
+            except Exception as e:
+                return f"Chart analysis unavailable: {str(e)}"
+
+    async def _enrich_page_async(self, page_data):
+        """
+        Helper to process a SINGLE page's OCR and Vision tasks.
+        This runs concurrently for multiple pages.
+        """
+        loop = asyncio.get_running_loop()
+        page_num = page_data["page_num"]
+        
+        # 1. Run OCR (if needed) in Parallel Executor
+        if page_data["needs_ocr"]:
+            try:
+                ocr_text = await loop.run_in_executor(
+                    self.process_executor, _run_paddle_ocr, page_data["scan_bytes"]
+                )
+                # Chunk OCR results
+                ocr_chunks = _create_sentence_window_chunks(ocr_text, page_num)
+                page_data["chunks"].extend(ocr_chunks)
+            except Exception as e:
+                print(f"OCR Failed on page {page_num}: {e}")
+
+        # 2. Run Vision AI (if needed) concurrently
+        if page_data["images"]:
+            # Process all images on this page in parallel
+            img_tasks = [self.analyze_image(b) for b in page_data["images"]]
+            captions = await asyncio.gather(*img_tasks)
+            
+            for cap in captions:
+                page_data["chunks"].append({
+                    "text": f"Chart/Figure on Page {page_num}: {cap}",
+                    "type": "chart", 
+                    "metadata": {"source": "imf_chart"}
+                })
+        
+        return page_data["chunks"]
 
     async def ingest_document(self, pdf_path: str, progress=gr.Progress()):
         if not os.path.exists(pdf_path): return "Error: File not found."
@@ -175,91 +230,110 @@ class AsyncContextRAG:
         total_pages = len(doc)
         doc.close()
         
-        progress(0, desc=f"Starting ingestion for {total_pages} pages...")
+        progress(0.1, desc=f"Parsing {total_pages} pages (CPU Parallel)...")
         loop = asyncio.get_running_loop()
         
-        # 1. Parsing
-        tasks = [
+        # --- STAGE 1: CPU Parallel Parsing (Fast) ---
+        parse_tasks = [
             loop.run_in_executor(self.process_executor, _cpu_process_page_context_aware, pdf_path, i)
             for i in range(total_pages)
         ]
-        raw_pages = await asyncio.gather(*tasks)
+        raw_pages = await asyncio.gather(*parse_tasks)
 
-        # 2. Enrichment & Upload
+        # --- STAGE 2: Async Parallel Enrichment (OCR/Vision) ---
+        progress(0.3, desc="Enriching pages (OCR + Vision AI)...")
+        
+        # Create tasks for all pages to run concurrently
+        enrichment_tasks = [self._enrich_page_async(page) for page in raw_pages]
+        
+        # Gather results (blocks until all pages are done)
+        all_page_chunks = await asyncio.gather(*enrichment_tasks)
+        
+        # Flatten list of lists
+        all_chunks = [chunk for page_chunks in all_page_chunks for chunk in page_chunks]
+
+        if not all_chunks:
+            return "⚠️ No indexable content found."
+
+        # --- STAGE 3: Bulk Embedding & Indexing ---
+        progress(0.7, desc=f"Embedding {len(all_chunks)} chunks...")
+        
         points_to_upsert = []
         import uuid
 
-        for i, page_data in enumerate(raw_pages):
-            progress((i / total_pages), desc=f"Enriching Page {i+1} (OCR/Vision)...")
-            page_num = page_data["page_num"]
+        # Batch Embeddings (Much faster than single embeddings)
+        texts = [c["text"] for c in all_chunks]
+        
+        # FastEmbed is efficient with large batches
+        embeddings = list(self.embed_model.embed(texts))
+
+        for i, chunk in enumerate(all_chunks):
+            points_to_upsert.append(PointStruct(
+                id=str(uuid.uuid4()),
+                vector=embeddings[i].tolist(),
+                payload={
+                    "text": chunk["text"],
+                    "type": chunk["type"],
+                    "page": chunk.get("metadata", {}).get("page_num", 0), 
+                    "metadata": chunk["metadata"]
+                }
+            ))
+
+        # Upload in larger batches
+        batch_size = 100
+        for i in range(0, len(points_to_upsert), batch_size):
+            await self.client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=points_to_upsert[i:i+batch_size]
+            )
             
-            # OCR
-            if page_data["needs_ocr"]:
-                ocr_text = await loop.run_in_executor(
-                    self.process_executor, _run_paddle_ocr, page_data["scan_bytes"]
-                )
-                ocr_chunks = _create_sentence_window_chunks(ocr_text, page_num)
-                page_data["chunks"].extend(ocr_chunks)
-
-            # Vision
-            if page_data["images"]:
-                img_tasks = [self.analyze_image(b) for b in page_data["images"]]
-                captions = await asyncio.gather(*img_tasks)
-                for cap in captions:
-                    page_data["chunks"].append({
-                        "text": f"Chart/Figure on Page {page_num}: {cap}",
-                        "type": "chart", 
-                        "metadata": {"source": "imf_chart"}
-                    })
-
-            if not page_data["chunks"]: continue
-
-            texts = [c["text"] for c in page_data["chunks"]]
-            embeddings = list(self.embed_model.embed(texts))
-
-            for idx, chunk in enumerate(page_data["chunks"]):
-                points_to_upsert.append(PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=embeddings[idx].tolist(),
-                    payload={
-                        "text": chunk["text"],
-                        "type": chunk["type"],
-                        "page": page_num,
-                        "metadata": chunk["metadata"]
-                    }
-                ))
-
-        if points_to_upsert:
-            batch_size = 100
-            for i in range(0, len(points_to_upsert), batch_size):
-                await self.client.upsert(
-                    collection_name=COLLECTION_NAME,
-                    points=points_to_upsert[i:i+batch_size]
-                )
-            return f"Success! Indexed {len(points_to_upsert)} chunks from {total_pages} pages."
-        else:
-            return "No indexable content found."
+        return f"✅ Speed Ingestion Complete! Indexed {len(points_to_upsert)} chunks in {total_pages} pages."
 
     async def query(self, user_query: str):
+        # Check Cache First
+        if user_query in self.query_cache:
+            return self.query_cache[user_query]
+
+        # 1. Embed Query
         query_vec = list(self.embed_model.embed([user_query]))[0].tolist()
         
+        # 2. Retrieve Broad Set (Top 25)
         search_results = await self.client.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_vec,
-            limit=10
+            limit=25
         )
+
+        if not search_results:
+            return "No relevant data found.", []
+
+        # 3. Re-Rank (Top 5)
+        passages = [
+            {"id": hit.id, "text": hit.payload["text"], "meta": hit.payload}
+            for hit in search_results
+        ]
+        
+        rerank_request = RerankRequest(query=user_query, passages=passages)
+        ranked_results = self.reranker.rank(rerank_request)
+        
+        top_context = ranked_results[:5]
 
         context_str = ""
         citations = []
-        for hit in search_results:
-            meta = hit.payload
-            citations.append(f"Page {meta['page']}")
-            context_str += f"\n[Source: Page {meta['page']} | Type: {meta['type']}]\n{meta['text']}\n"
+        for hit in top_context:
+            meta = hit["meta"]
+            citations.append(f"Page {meta.get('page', '?')}")
+            context_str += f"\n[Source: Page {meta.get('page', '?')} | {meta.get('type', 'text')}]\n{hit['text']}\n"
 
+        # 4. Prompt
         prompt = f"""
-        You are an expert economic policy analyst. Answer using ONLY the context.
-        Cite sources (e.g., [Source: Page 4]). If data is missing, state "Data not found."
-
+        Role: Expert Financial Policy Analyst.
+        Task: Answer the question using ONLY the context below.
+        Rules:
+        1. Be concise. No fluff.
+        2. If numbers are present, quote them exactly.
+        3. Cite sources (e.g. [Page 4]).
+        
         CONTEXT:
         {context_str}
 
@@ -268,19 +342,20 @@ class AsyncContextRAG:
         """
         
         response = await self.gemini_model.generate_content_async(prompt)
-        return response.text, list(set(citations))
+        final_answer = response.text
+        
+        self.query_cache[user_query] = (final_answer, list(set(citations)))
+        
+        return final_answer, list(set(citations))
 
-# --- 3. GRADIO INTERFACE LOGIC ---
+# --- 3. GRADIO INTERFACE ---
 
 rag_system = AsyncContextRAG()
 
 async def handle_ingest(file_obj, url_text):
-    # Initialize DB first
     await rag_system.initialize_db()
-    
     target_path = ""
     
-    # Scenario A: URL provided
     if url_text and url_text.strip():
         try:
             response = requests.get(url_text)
@@ -290,57 +365,44 @@ async def handle_ingest(file_obj, url_text):
                     f.write(response.content)
                 target_path = filename
             else:
-                return f"Error downloading URL: Status {response.status_code}"
+                return f"❌ Error: {response.status_code}"
         except Exception as e:
-            return f"Error downloading URL: {str(e)}"
-            
-    # Scenario B: File Uploaded
+            return f"❌ Error: {str(e)}"
     elif file_obj is not None:
         target_path = file_obj.name
-    
     else:
-        return "Please upload a file or provide a URL."
+        return "⚠️ Upload file or enter URL."
 
     return await rag_system.ingest_document(target_path)
 
 async def chat_response(message, history):
     answer, citations = await rag_system.query(message)
-    
-    citation_str = "\n\nSources: " + ", ".join(citations) if citations else ""
-    final_response = answer + citation_str
-    
-    return final_response
+    citation_str = "\n\n📚 **Sources:** " + ", ".join(citations) if citations else ""
+    return answer + citation_str
 
-# --- 4. UI BUILDER ---
+# --- 4. UI ---
 
-with gr.Blocks(title="Financial Policy Analyst RAG", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# Financial Policy Analyst RAG")
-    gr.Markdown("Async, Multi-Modal (Text + Tables + Charts) analysis of IMF & Finance Reports.")
+with gr.Blocks(title="Optimized Financial RAG", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# ⚡ Optimized Financial Policy RAG")
+    gr.Markdown("Features: Async Ingestion • Re-Ranking (FlashRank) • Caching • Multi-Modal")
 
-    with gr.Accordion("Knowledge Base Ingestion", open=True):
+    with gr.Accordion("📂 Ingestion", open=True):
         with gr.Row():
-            file_input = gr.File(label="Upload PDF Report", file_types=[".pdf"])
-            url_input = gr.Textbox(label="OR Enter PDF URL", placeholder="https://www.imf.org/.../report.pdf")
-        
-        ingest_btn = gr.Button("Ingest Document", variant="primary")
-        ingest_status = gr.Textbox(label="Status", interactive=False)
+            file_input = gr.File(label="Upload PDF", file_types=[".pdf"])
+            url_input = gr.Textbox(label="OR PDF URL", placeholder="https://...")
+        ingest_btn = gr.Button("Ingest", variant="primary")
+        ingest_status = gr.Textbox(label="Status")
 
-    with gr.Row():
-        chatbot = gr.ChatInterface(
-            fn=chat_response,
-            title="💬 Policy Analyst Chat",
-            description="Ask about GDP projections, debt sustainability, or specific charts.",
-            examples=["What are the downside risks to growth?", "Summarize the debt sustainability analysis.", "What does the fan chart indicate about inflation?"],
-        )
-
-    # Event Handlers
-    ingest_btn.click(
-        fn=handle_ingest, 
-        inputs=[file_input, url_input], 
-        outputs=[ingest_status]
+    # FIX: Added type="messages" to satisfy Gradio warning
+    chatbot = gr.ChatInterface(
+        fn=chat_response,
+        type="messages", 
+        title="💬 Analyst Chat",
+        description="Ask about GDP, Debt, or Charts.",
+        examples=["What is the GDP projection?", "Summarize debt risks."],
     )
 
-# --- 5. LAUNCH ---
+    ingest_btn.click(handle_ingest, [file_input, url_input], [ingest_status])
 
 if __name__ == "__main__":
     demo.launch()
