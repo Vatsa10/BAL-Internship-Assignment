@@ -18,7 +18,12 @@ from paddleocr import PaddleOCR
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"  
-QDRANT_URL = "http://localhost:6333"
+
+# Qdrant Cloud / API Configuration
+# Get these from https://cloud.qdrant.io/
+QDRANT_URL = "https://your-cluster-url.qdrant.io:6333" 
+QDRANT_API_KEY = "YOUR_QDRANT_API_KEY_HERE"
+
 COLLECTION_NAME = "imf_policy_reports_v1" # Specialized Collection
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
@@ -145,7 +150,13 @@ def _cpu_process_page_context_aware(pdf_path: str, page_num: int) -> Dict[str, A
 class AsyncContextRAG:
     def __init__(self):
         self.process_executor = ProcessPoolExecutor(max_workers=os.cpu_count())
-        self.client = AsyncQdrantClient(url=QDRANT_URL)
+        
+        # Initialize Client with API Key for Cloud Support
+        self.client = AsyncQdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY, 
+        )
+        
         self.embed_model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
         self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 
@@ -298,9 +309,9 @@ async def main():
         if choice.lower().strip() == 'y':
             await rag.ingest_document(pdf_file)
     else:
-        print(f"⚠️ PDF {pdf_file} not found.")
+        print(f"PDF {pdf_file} not found.")
         
-    print("\n💬 Policy Analyst Bot Ready. Ask about GDP, Debt, or Structural Reforms.")
+    print("\nPolicy Analyst Bot Ready. Ask about GDP, Debt, or Structural Reforms.")
     while True:
         q = input("\nQuery: ")
         if q == "exit": break
