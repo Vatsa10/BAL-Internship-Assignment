@@ -10,6 +10,7 @@ import gradio as gr
 from typing import List, Dict, Any, Tuple
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from dotenv import load_dotenv
 
 # --- LIBRARIES ---
 from qdrant_client import AsyncQdrantClient
@@ -19,11 +20,18 @@ import google.generativeai as genai
 from paddleocr import PaddleOCR
 
 # --- CONFIGURATION ---
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"  
+# Load environment variables from .env file
+load_dotenv()
 
-# Qdrant Cloud / API Configuration
-QDRANT_URL = "https://your-cluster-url.qdrant.io:6333" 
-QDRANT_API_KEY = "YOUR_QDRANT_API_KEY_HERE"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+# Validation
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found in .env file")
+if not QDRANT_URL:
+    raise ValueError("QDRANT_URL not found in .env file")
 
 COLLECTION_NAME = "imf_policy_reports_v1" 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
@@ -38,6 +46,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 def _run_paddle_ocr(image_bytes: bytes) -> str:
     """Runs PaddleOCR on an image byte stream."""
+    # Using a lightweight CPU config for PaddleOCR
     ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -227,9 +236,9 @@ class AsyncContextRAG:
                     collection_name=COLLECTION_NAME,
                     points=points_to_upsert[i:i+batch_size]
                 )
-            return f"✅ Success! Indexed {len(points_to_upsert)} chunks from {total_pages} pages."
+            return f"Success! Indexed {len(points_to_upsert)} chunks from {total_pages} pages."
         else:
-            return "⚠️ No indexable content found."
+            return "No indexable content found."
 
     async def query(self, user_query: str):
         query_vec = list(self.embed_model.embed([user_query]))[0].tolist()
@@ -281,28 +290,23 @@ async def handle_ingest(file_obj, url_text):
                     f.write(response.content)
                 target_path = filename
             else:
-                return f"❌ Error downloading URL: Status {response.status_code}"
+                return f"Error downloading URL: Status {response.status_code}"
         except Exception as e:
-            return f"❌ Error downloading URL: {str(e)}"
+            return f"Error downloading URL: {str(e)}"
             
     # Scenario B: File Uploaded
     elif file_obj is not None:
         target_path = file_obj.name
     
     else:
-        return "⚠️ Please upload a file or provide a URL."
+        return "Please upload a file or provide a URL."
 
     return await rag_system.ingest_document(target_path)
 
 async def chat_response(message, history):
-    # History format: [[user_msg, bot_msg], ...]
-    # We don't necessarily need history for the RAG search context unless we build a conversational memory.
-    # For now, strictly RAG based on current query.
-    
     answer, citations = await rag_system.query(message)
     
-    # Format citations
-    citation_str = "\n\n📚 **Sources:** " + ", ".join(citations) if citations else ""
+    citation_str = "\n\nSources: " + ", ".join(citations) if citations else ""
     final_response = answer + citation_str
     
     return final_response
@@ -310,15 +314,15 @@ async def chat_response(message, history):
 # --- 4. UI BUILDER ---
 
 with gr.Blocks(title="Financial Policy Analyst RAG", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 📈 Financial Policy Analyst RAG")
+    gr.Markdown("# Financial Policy Analyst RAG")
     gr.Markdown("Async, Multi-Modal (Text + Tables + Charts) analysis of IMF & Finance Reports.")
 
-    with gr.Accordion("📂 Knowledge Base Ingestion", open=True):
+    with gr.Accordion("Knowledge Base Ingestion", open=True):
         with gr.Row():
             file_input = gr.File(label="Upload PDF Report", file_types=[".pdf"])
             url_input = gr.Textbox(label="OR Enter PDF URL", placeholder="https://www.imf.org/.../report.pdf")
         
-        ingest_btn = gr.Button("🚀 Ingest Document", variant="primary")
+        ingest_btn = gr.Button("Ingest Document", variant="primary")
         ingest_status = gr.Textbox(label="Status", interactive=False)
 
     with gr.Row():
@@ -339,7 +343,4 @@ with gr.Blocks(title="Financial Policy Analyst RAG", theme=gr.themes.Soft()) as 
 # --- 5. LAUNCH ---
 
 if __name__ == "__main__":
-    # Ensure DB is ready before starting? 
-    # In async Gradio, we can init strictly inside the event loop, 
-    # but running this wrapper ensures the loop is handled by Gradio.
     demo.launch()
