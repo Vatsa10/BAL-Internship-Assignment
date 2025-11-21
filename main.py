@@ -7,7 +7,8 @@ import cv2
 import numpy as np
 import requests
 import gradio as gr
-from typing import List, Dict, Any, Tuple
+import qdrant_client 
+from typing import List, Dict, Any
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -17,9 +18,23 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import PointStruct, VectorParams, Distance
 from fastembed import TextEmbedding
 import google.generativeai as genai
-from paddleocr import PaddleOCR
+
+# Safe Import for PaddleOCR to prevent crashes if engine is missing
+PADDLE_AVAILABLE = False
+try:
+    import paddle
+    from paddleocr import PaddleOCR
+    PADDLE_AVAILABLE = True
+except ImportError:
+    print("⚠️ Warning: 'paddlepaddle' or 'paddleocr' not found. OCR will be skipped.")
+
 # pip install flashrank
-from flashrank import Ranker, RerankRequest
+try:
+    from flashrank import Ranker, RerankRequest
+    FLASHRANK_AVAILABLE = True
+except ImportError:
+    FLASHRANK_AVAILABLE = False
+    print("⚠️ Warning: 'flashrank' not found. Re-ranking will be skipped.")
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -31,7 +46,7 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("❌ GEMINI_API_KEY not found in .env file")
 
-COLLECTION_NAME = "imf_policy_reports_opt_v2" 
+COLLECTION_NAME = "imf_policy_reports_final_v4" 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 # Chunking Settings 
@@ -44,22 +59,27 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 def _run_paddle_ocr(image_bytes: bytes) -> str:
     """Runs PaddleOCR on an image byte stream."""
-    # FIX: Removed 'show_log=False' which caused the ValueError in newer PaddleOCR versions
-    ocr = PaddleOCR(use_angle_cls=True, lang='en') 
-    
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
-    # PaddleOCR might return None if no text found
-    result = ocr.ocr(img, cls=True)
-    
-    extracted_text = []
-    if result and isinstance(result, list) and len(result) > 0 and result[0]:
-        for line in result[0]:
-            if line and len(line) > 1:
-                extracted_text.append(line[1][0])
-                
-    return "\n".join(extracted_text)
+    if not PADDLE_AVAILABLE:
+        return ""
+
+    try:
+        # FIX: Removed 'show_log=False' (deprecated in newer paddleocr)
+        ocr = PaddleOCR(use_angle_cls=True, lang='en') 
+        
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        result = ocr.ocr(img, cls=True)
+        
+        extracted_text = []
+        if result and isinstance(result, list) and len(result) > 0 and result[0]:
+            for line in result[0]:
+                if line and len(line) > 1:
+                    extracted_text.append(line[1][0])
+        return "\n".join(extracted_text)
+    except Exception as e:
+        print(f"OCR Error: {e}")
+        return ""
 
 def _create_sentence_window_chunks(text: str, page_num: int) -> List[Dict]:
     """Splits text into sentences and creates overlapping windows."""
@@ -138,7 +158,6 @@ def _cpu_process_page_context_aware(pdf_path: str, page_num: int) -> Dict[str, A
 
         # C. TEXT CHUNKING
         text_content = page.get_text()
-        # Heuristic: If < 50 chars of text, assume scanned page
         if len(text_content) < 50:
             result_data["needs_ocr"] = True
             pix = page.get_pixmap()
@@ -158,16 +177,21 @@ def _cpu_process_page_context_aware(pdf_path: str, page_num: int) -> Dict[str, A
 class AsyncContextRAG:
     def __init__(self):
         self.process_executor = ProcessPoolExecutor(max_workers=os.cpu_count())
+        
+        # Initialize Qdrant Client
         self.client = AsyncQdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        
         self.embed_model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
         self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
         
-        # Local Re-Ranker
-        self.reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="./flashrank_cache")
+        # Local Re-Ranker (FlashRank)
+        if FLASHRANK_AVAILABLE:
+            self.reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="./flashrank_cache")
+        else:
+            self.reranker = None
+            
         self.query_cache = {}
-        
-        # Semaphore to limit concurrent calls to Gemini API (prevents 429 errors)
-        self.sem = asyncio.Semaphore(8) 
+        self.sem = asyncio.Semaphore(10) 
 
     async def initialize_db(self):
         if not await self.client.collection_exists(COLLECTION_NAME):
@@ -189,20 +213,16 @@ class AsyncContextRAG:
                 return f"Chart analysis unavailable: {str(e)}"
 
     async def _enrich_page_async(self, page_data):
-        """
-        Helper to process a SINGLE page's OCR and Vision tasks.
-        This runs concurrently for multiple pages.
-        """
+        """Helper to process a SINGLE page's OCR and Vision tasks concurrently."""
         loop = asyncio.get_running_loop()
         page_num = page_data["page_num"]
         
         # 1. Run OCR (if needed) in Parallel Executor
-        if page_data["needs_ocr"]:
+        if page_data["needs_ocr"] and PADDLE_AVAILABLE:
             try:
                 ocr_text = await loop.run_in_executor(
                     self.process_executor, _run_paddle_ocr, page_data["scan_bytes"]
                 )
-                # Chunk OCR results
                 ocr_chunks = _create_sentence_window_chunks(ocr_text, page_num)
                 page_data["chunks"].extend(ocr_chunks)
             except Exception as e:
@@ -210,7 +230,6 @@ class AsyncContextRAG:
 
         # 2. Run Vision AI (if needed) concurrently
         if page_data["images"]:
-            # Process all images on this page in parallel
             img_tasks = [self.analyze_image(b) for b in page_data["images"]]
             captions = await asyncio.gather(*img_tasks)
             
@@ -233,23 +252,19 @@ class AsyncContextRAG:
         progress(0.1, desc=f"Parsing {total_pages} pages (CPU Parallel)...")
         loop = asyncio.get_running_loop()
         
-        # --- STAGE 1: CPU Parallel Parsing (Fast) ---
+        # --- STAGE 1: CPU Parallel Parsing ---
         parse_tasks = [
             loop.run_in_executor(self.process_executor, _cpu_process_page_context_aware, pdf_path, i)
             for i in range(total_pages)
         ]
         raw_pages = await asyncio.gather(*parse_tasks)
 
-        # --- STAGE 2: Async Parallel Enrichment (OCR/Vision) ---
+        # --- STAGE 2: Async Parallel Enrichment ---
         progress(0.3, desc="Enriching pages (OCR + Vision AI)...")
-        
-        # Create tasks for all pages to run concurrently
         enrichment_tasks = [self._enrich_page_async(page) for page in raw_pages]
-        
-        # Gather results (blocks until all pages are done)
         all_page_chunks = await asyncio.gather(*enrichment_tasks)
         
-        # Flatten list of lists
+        # Flatten chunks
         all_chunks = [chunk for page_chunks in all_page_chunks for chunk in page_chunks]
 
         if not all_chunks:
@@ -261,10 +276,8 @@ class AsyncContextRAG:
         points_to_upsert = []
         import uuid
 
-        # Batch Embeddings (Much faster than single embeddings)
+        # Batch Embedding
         texts = [c["text"] for c in all_chunks]
-        
-        # FastEmbed is efficient with large batches
         embeddings = list(self.embed_model.embed(texts))
 
         for i, chunk in enumerate(all_chunks):
@@ -275,11 +288,11 @@ class AsyncContextRAG:
                     "text": chunk["text"],
                     "type": chunk["type"],
                     "page": chunk.get("metadata", {}).get("page_num", 0), 
-                    "metadata": chunk["metadata"]
+                    "metadata": chunk.get("metadata", {})
                 }
             ))
 
-        # Upload in larger batches
+        # Batch Upload
         batch_size = 100
         for i in range(0, len(points_to_upsert), batch_size):
             await self.client.upsert(
@@ -290,15 +303,14 @@ class AsyncContextRAG:
         return f"✅ Speed Ingestion Complete! Indexed {len(points_to_upsert)} chunks in {total_pages} pages."
 
     async def query(self, user_query: str):
-        # Check Cache First
         if user_query in self.query_cache:
             return self.query_cache[user_query]
 
-        # 1. Embed Query
+        # 1. Embed
         query_vec = list(self.embed_model.embed([user_query]))[0].tolist()
         
-        # 2. Retrieve Broad Set (Top 25)
-        search_results = await self.client.search(
+        # 2. Search
+        search_results = await self.client.search_points(
             collection_name=COLLECTION_NAME,
             query_vector=query_vec,
             limit=25
@@ -307,25 +319,30 @@ class AsyncContextRAG:
         if not search_results:
             return "No relevant data found.", []
 
-        # 3. Re-Rank (Top 5)
-        passages = [
-            {"id": hit.id, "text": hit.payload["text"], "meta": hit.payload}
-            for hit in search_results
-        ]
-        
-        rerank_request = RerankRequest(query=user_query, passages=passages)
-        ranked_results = self.reranker.rank(rerank_request)
-        
-        top_context = ranked_results[:5]
+        # 3. Re-Rank (if available)
+        if FLASHRANK_AVAILABLE and self.reranker:
+            passages = [
+                {"id": hit.id, "text": hit.payload["text"], "meta": hit.payload}
+                for hit in search_results
+            ]
+            rerank_request = RerankRequest(query=user_query, passages=passages)
+            ranked_results = self.reranker.rank(rerank_request)
+            top_context = ranked_results[:5]
+        else:
+            top_context = search_results[:5]
 
         context_str = ""
         citations = []
         for hit in top_context:
-            meta = hit["meta"]
-            citations.append(f"Page {meta.get('page', '?')}")
-            context_str += f"\n[Source: Page {meta.get('page', '?')} | {meta.get('type', 'text')}]\n{hit['text']}\n"
+            # Handle differences between Qdrant hits and FlashRank hits
+            meta = hit["meta"] if isinstance(hit, dict) else hit.payload
+            text = hit["text"] if isinstance(hit, dict) else hit.payload["text"]
+            
+            page_num = meta.get('page', '?')
+            citations.append(f"Page {page_num}")
+            context_str += f"\n[Source: Page {page_num} | {meta.get('type', 'text')}]\n{text}\n"
 
-        # 4. Prompt
+        # 4. Generation
         prompt = f"""
         Role: Expert Financial Policy Analyst.
         Task: Answer the question using ONLY the context below.
@@ -345,7 +362,6 @@ class AsyncContextRAG:
         final_answer = response.text
         
         self.query_cache[user_query] = (final_answer, list(set(citations)))
-        
         return final_answer, list(set(citations))
 
 # --- 3. GRADIO INTERFACE ---
@@ -393,13 +409,11 @@ with gr.Blocks(title="Optimized Financial RAG", theme=gr.themes.Soft()) as demo:
         ingest_btn = gr.Button("Ingest", variant="primary")
         ingest_status = gr.Textbox(label="Status")
 
-    # FIX: Added type="messages" to satisfy Gradio warning
     chatbot = gr.ChatInterface(
         fn=chat_response,
         type="messages", 
         title="💬 Analyst Chat",
         description="Ask about GDP, Debt, or Charts.",
-        examples=["What is the GDP projection?", "Summarize debt risks."],
     )
 
     ingest_btn.click(handle_ingest, [file_input, url_input], [ingest_status])
