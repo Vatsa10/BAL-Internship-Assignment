@@ -8,6 +8,7 @@ import numpy as np
 import requests
 import gradio as gr
 import qdrant_client
+import uuid  # <--- MOVED TO TOP TO FIX UnboundLocalError
 from typing import List, Dict, Any
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -28,6 +29,9 @@ try:
     import paddle
     from paddleocr import PaddleOCR
     PADDLE_AVAILABLE = True
+    # Suppress Paddle Logs
+    import logging
+    logging.getLogger("ppocr").setLevel(logging.ERROR)
 except ImportError:
     print("⚠️ Warning: 'paddleocr' engine not found. OCR will be skipped.")
 
@@ -64,11 +68,15 @@ def _run_paddle_ocr(image_bytes: bytes) -> str:
     """Runs PaddleOCR on an image byte stream."""
     if not PADDLE_AVAILABLE: return ""
     try:
-        # Initialize without show_log to avoid errors in newer versions
-        ocr = PaddleOCR(use_angle_cls=True, lang='en') 
+        # Initialize PaddleOCR
+        # Note: use_angle_cls=False to prevent 'cls' argument errors in some versions
+        ocr = PaddleOCR(use_angle_cls=False, lang='en', show_log=False) 
+        
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        result = ocr.ocr(img, cls=True)
+        
+        # Run OCR (cls=False for stability)
+        result = ocr.ocr(img, cls=False)
         
         extracted_text = []
         if result and isinstance(result, list) and len(result) > 0 and result[0]:
@@ -132,9 +140,12 @@ def _cpu_process_page(pdf_path: str, page_num: int) -> Dict[str, Any]:
 
         # Image Extraction
         for img in page.get_images(full=True):
-            base_image = doc.extract_image(img[0])
-            if len(base_image["image"]) > 5000: 
-                result_data["images"].append(base_image["image"])
+            try:
+                base_image = doc.extract_image(img[0])
+                if len(base_image["image"]) > 5000: 
+                    result_data["images"].append(base_image["image"])
+            except:
+                pass
 
         # Text Extraction
         text_content = page.get_text()
@@ -199,10 +210,16 @@ class AsyncContextRAG:
         loop = asyncio.get_running_loop()
         page_num = page_data["page_num"]
         
+        # OCR Block
         if page_data["needs_ocr"] and PADDLE_AVAILABLE:
-            ocr_text = await loop.run_in_executor(self.process_executor, _run_paddle_ocr, page_data["scan_bytes"])
-            page_data["chunks"].extend(_create_sentence_window_chunks(ocr_text, page_num))
+            try:
+                ocr_text = await loop.run_in_executor(self.process_executor, _run_paddle_ocr, page_data["scan_bytes"])
+                if ocr_text:
+                    page_data["chunks"].extend(_create_sentence_window_chunks(ocr_text, page_num))
+            except Exception as e:
+                print(f"Page {page_num} OCR Skip: {e}")
 
+        # Vision Block
         if page_data["images"]:
             img_tasks = [self.analyze_image(b) for b in page_data["images"]]
             captions = await asyncio.gather(*img_tasks)
@@ -242,6 +259,7 @@ class AsyncContextRAG:
         texts = [c["text"] for c in all_chunks]
         embeddings = list(self.embed_model.embed(texts))
         
+        # FIX: uuid imported at top level now
         points = [
             PointStruct(
                 id=str(uuid.uuid4()),
@@ -255,7 +273,6 @@ class AsyncContextRAG:
             ) for i, c in enumerate(all_chunks)
         ]
 
-        import uuid
         batch_size = 100
         for i in range(0, len(points), batch_size):
             await self.client.upsert(COLLECTION_NAME, points[i:i+batch_size])
@@ -267,8 +284,6 @@ class AsyncContextRAG:
 
         query_vec = list(self.embed_model.embed([user_query]))[0].tolist()
         
-        # FIX: Replaced 'search' with 'query_points' or 'search_points' based on availability
-        # This handles the Version Mismatch error gracefully
         try:
             # Try Modern API (v1.10+)
             search_results = await self.client.query_points(
@@ -340,7 +355,7 @@ async def handle_ingest(file_obj, url_text):
 
 async def chat_Wrapper(msg, hist):
     ans, cits = await rag_system.query(msg)
-    return f"{ans}\n\n📚 **Sources:** {', '.join(cits)}" if cits else ans
+    return f"{ans}\n\n📚 **Sources:** {', '.join(map(str, cits))}" if cits else ans
 
 with gr.Blocks(title="IMF Analyst RAG") as demo:
     gr.Markdown("# 📈 Financial Policy Analyst RAG")
