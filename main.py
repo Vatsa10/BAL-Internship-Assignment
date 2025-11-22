@@ -44,7 +44,7 @@ try:
     FLASHRANK_AVAILABLE = True
 except ImportError:
     FLASHRANK_AVAILABLE = False
-    print("⚠️ Warning: 'flashrank' not found. Reranking disabled.")
+    print("Warning: 'flashrank' not found. Reranking disabled.")
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -55,7 +55,7 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 # FIX: New Collection Name for Fresh Context-Aware Ingestion
 COLLECTION_NAME = "docling_financial_context_v4"
 
-if not GEMINI_API_KEY: raise ValueError("❌ GEMINI_API_KEY missing")
+if not GEMINI_API_KEY: raise ValueError("GEMINI_API_KEY missing")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -83,23 +83,23 @@ class AsyncDoclingRAG:
         self.sem = asyncio.Semaphore(10) 
         self.reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="./flashrank_cache") if FLASHRANK_AVAILABLE else None
 
-        print("✅ Advanced RAG System Initialized.")
+        print("Advanced RAG System Initialized.")
 
     async def check_database(self) -> str:
         try:
             if await self.client.collection_exists(COLLECTION_NAME):
                 cnt = (await self.client.count(COLLECTION_NAME)).count
                 if cnt > 0:
-                    return f"### ✅ Ready\n**Collection:** `{COLLECTION_NAME}`\n**Vectors:** {cnt}\n*Context-Aware Mode Active*"
+                    return f"### Ready\n**Collection:** `{COLLECTION_NAME}`\n**Vectors:** {cnt}\n*Context-Aware Mode Active*"
                 else:
-                    return f"### ⚠️ Empty\nCollection `{COLLECTION_NAME}` exists but is empty."
-            return f"### ❌ Not Found\nCollection `{COLLECTION_NAME}` missing. Please ingest."
+                    return f"### Empty\nCollection `{COLLECTION_NAME}` exists but is empty."
+            return f"### Not Found\nCollection `{COLLECTION_NAME}` missing. Please ingest."
         except Exception as e:
-            return f"### ❌ Connection Error\n{str(e)}"
+            return f"### Connection Error\n{str(e)}"
 
     async def initialize_db(self):
         if not await self.client.collection_exists(COLLECTION_NAME):
-            print(f"⚙️ Creating Collection: {COLLECTION_NAME}")
+            print(f"Creating Collection: {COLLECTION_NAME}")
             await self.client.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config={"dense": VectorParams(size=384, distance=Distance.COSINE)},
@@ -288,16 +288,28 @@ class AsyncDoclingRAG:
         for i in range(0, len(points), batch_size):
             await self.client.upsert(COLLECTION_NAME, points[i:i+batch_size])
             
-        return f"✅ Success! Ingested {len(points)} chunks."
+        return f"Success! Ingested {len(points)} chunks."
 
     # --- QUERY LOGIC ---
     async def query(self, text: str):
         dense_vec = list(self.dense_model.embed([text]))[0].tolist()
         sparse_vec = list(self.sparse_model.embed([text]))[0].as_object()
         
-        # Detect if query is about tables for enhanced retrieval
+        # Detect query type for enhanced retrieval
         is_table_query = any(keyword in text.lower() for keyword in ["table", "macroeconomic", "indicators", "data"])
-        limit_size = 25 if is_table_query else 20
+        is_chart_query = any(keyword in text.lower() for keyword in ["figure", "chart", "graph", "visual"])
+        is_text_query = not is_table_query and not is_chart_query
+        
+        # Adjust retrieval limits based on query type
+        if is_table_query:
+            limit_size = 30
+            top_k = 12
+        elif is_chart_query:
+            limit_size = 25
+            top_k = 10
+        else:  # text queries
+            limit_size = 25
+            top_k = 10
         
         # 1. Hybrid Retrieval (Increased limit to catch specific figures)
         response = await self.client.query_points(
@@ -316,9 +328,9 @@ class AsyncDoclingRAG:
         if FLASHRANK_AVAILABLE and self.reranker:
             passages = [{"id": h.id, "text": h.payload["text"], "meta": h.payload} for h in hits]
             ranked = self.reranker.rerank(RerankRequest(query=text, passages=passages))
-            top_hits = ranked[:10] if is_table_query else ranked[:7] # More context for tables
+            top_hits = ranked[:top_k]
         else:
-            top_hits = hits[:10] if is_table_query else hits[:7]
+            top_hits = hits[:top_k]
 
         # 3. Formatting
         ctx_parts = []
@@ -341,23 +353,24 @@ class AsyncDoclingRAG:
 
         ctx = "\n".join(ctx_parts)
         
-        # 4. Strict Persona Prompt with Enhanced Table Analysis
-        prompt = f"""
+        # 4. Adaptive Prompt Based on Query Type
+        if is_table_query:
+            prompt = f"""
         You are a Senior Financial Analyst evaluating an IMF Article IV report.
         
-        STRICT RULES:
+        TASK: Analyze the table data comprehensively.
+        
+        INSTRUCTIONS:
         1. Answer using ONLY the provided context.
-        2. If the user asks about a Figure (e.g., Figure 4), look for "Figure 4" in the source text.
-        3. If the user asks for targets or numbers (e.g., "7 strategic outcomes"), list them exactly as they appear.
-        4. Do NOT summarize vaguely. Extract specific data points, percentages, and years.
-        5. If the context contains a Chart Analysis, treat it as factual data from the report.
-        6. **FOR TABLES**: Provide comprehensive analysis including:
+        2. Provide comprehensive analysis including:
            - What the table measures and its significance
            - Key trends across the time period (historical vs. projections)
            - Notable changes or anomalies in the data
            - Comparative analysis between different indicators
            - Economic implications of the trends shown
            - Sector-specific insights (if applicable)
+        3. Extract specific data points, percentages, and years exactly as they appear.
+        4. Do NOT summarize vaguely.
         
         CONTEXT:
         {ctx}
@@ -371,6 +384,62 @@ class AsyncDoclingRAG:
         - Highlight significant changes or patterns
         - Explain the economic implications
         - Include specific numbers and percentages from the table
+        """
+        elif is_chart_query:
+            prompt = f"""
+        You are a Senior Financial Analyst evaluating an IMF Article IV report.
+        
+        TASK: Analyze the chart/figure data comprehensively.
+        
+        INSTRUCTIONS:
+        1. Answer using ONLY the provided context.
+        2. If the user asks about a Figure (e.g., Figure 4), look for "Figure 4" in the source text.
+        3. Describe what the chart shows, including:
+           - Main data points and trends
+           - Key patterns and anomalies
+           - Comparative insights
+           - Economic implications
+        4. If the context contains a Chart Analysis, treat it as factual data from the report.
+        5. Extract specific data points and percentages exactly as they appear.
+        
+        CONTEXT:
+        {ctx}
+        
+        QUESTION: 
+        {text}
+        
+        RESPONSE FORMAT:
+        - Describe what the chart/figure shows
+        - Highlight key trends and patterns
+        - Provide specific data points
+        - Explain economic implications
+        """
+        else:  # text queries
+            prompt = f"""
+        You are a Senior Financial Analyst evaluating an IMF Article IV report.
+        
+        TASK: Provide a comprehensive answer to the question.
+        
+        INSTRUCTIONS:
+        1. Answer using ONLY the provided context.
+        2. Be thorough and detailed in your explanation.
+        3. Include specific examples, data points, and percentages from the report.
+        4. Explain the economic context and implications.
+        5. Do NOT summarize vaguely - provide substantive analysis.
+        6. If relevant, mention specific sections, tables, or figures from the report.
+        
+        CONTEXT:
+        {ctx}
+        
+        QUESTION: 
+        {text}
+        
+        RESPONSE FORMAT:
+        - Start with a direct answer to the question
+        - Provide detailed explanation with supporting evidence
+        - Include specific data points and examples
+        - Explain the broader economic implications
+        - Reference sources where relevant
         """
         
         res = await self.gemini_model.generate_content_async(prompt)
@@ -421,11 +490,11 @@ async def chat_wrapper(msg, h):
 async def briefing_wrapper(): return await get_rag().generate_briefing()
 
 with gr.Blocks(title="IMF Context RAG") as demo:
-    gr.Markdown("# 📈 Context-Aware Financial RAG")
-    stat = gr.Markdown("🔄 Checking...")
+    gr.Markdown("# Context-Aware Financial RAG")
+    stat = gr.Markdown("Checking...")
     demo.load(update_status, outputs=[stat])
     
-    with gr.Tab("💬 Chat"):
+    with gr.Tab("Chat"):
         with gr.Accordion("Ingest", open=False):
             with gr.Row():
                 f_in = gr.File(); u_in = gr.Textbox()
@@ -433,7 +502,7 @@ with gr.Blocks(title="IMF Context RAG") as demo:
             btn.click(run_ingest, [f_in, u_in], [out, stat])
         gr.ChatInterface(fn=chat_wrapper, type="messages")
         
-    with gr.Tab("📝 Briefing"):
+    with gr.Tab("Briefing"):
         b_btn = gr.Button("Generate Report"); b_out = gr.Markdown()
         b_btn.click(briefing_wrapper, outputs=[b_out])
 

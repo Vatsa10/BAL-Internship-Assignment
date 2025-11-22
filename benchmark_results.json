@@ -1,0 +1,223 @@
+{
+  "summary": {
+    "total_queries": 15,
+    "avg_response_time": 10.50337584813436,
+    "median_response_time": 10.56792688369751,
+    "min_response_time": 4.783807754516602,
+    "max_response_time": 19.15619444847107,
+    "avg_sources_retrieved": 1.9333333333333333,
+    "avg_response_length": 4321,
+    "avg_relevance_score": 4.8,
+    "avg_completeness_score": 3.933333333333333,
+    "avg_accuracy_score": 4.96,
+    "modality_breakdown": {
+      "chart": {
+        "count": 5,
+        "avg_response_time": 8.018097114562988,
+        "avg_relevance": 4.6,
+        "avg_completeness": 4.1,
+        "avg_accuracy": 5.0,
+        "avg_sources": 2.4
+      },
+      "table": {
+        "count": 5,
+        "avg_response_time": 12.721013355255128,
+        "avg_relevance": 5.0,
+        "avg_completeness": 4.2,
+        "avg_accuracy": 5.0,
+        "avg_sources": 2.4
+      },
+      "text": {
+        "count": 5,
+        "avg_response_time": 10.771017074584961,
+        "avg_relevance": 4.8,
+        "avg_completeness": 3.5,
+        "avg_accuracy": 4.88,
+        "avg_sources": 1
+      }
+    },
+    "total_duration": 157.5597014427185
+  },
+  "detailed_queries": [
+    {
+      "query_id": "text_001",
+      "query_text": "What are the main economic challenges and context for Qatar mentioned in the report?",
+      "modality": "text",
+      "response_time": 10.56792688369751,
+      "num_sources": 1,
+      "response_length": 6310,
+      "relevance_score": 5.0,
+      "completeness_score": 3.5,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:22:59.197374"
+    },
+    {
+      "query_id": "text_002",
+      "query_text": "Explain Qatar's medium-term outlook and the factors driving it",
+      "modality": "text",
+      "response_time": 9.560681343078613,
+      "num_sources": 1,
+      "response_length": 5119,
+      "relevance_score": 5.0,
+      "completeness_score": 3.5,
+      "accuracy_score": 4.7,
+      "timestamp": "2025-11-22T23:23:08.758313"
+    },
+    {
+      "query_id": "text_003",
+      "query_text": "What are the main risks to Qatar's economic outlook?",
+      "modality": "text",
+      "response_time": 10.021442174911499,
+      "num_sources": 1,
+      "response_length": 5506,
+      "relevance_score": 4.0,
+      "completeness_score": 3.5,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:23:18.780038"
+    },
+    {
+      "query_id": "text_004",
+      "query_text": "Describe the banking sector situation in Qatar",
+      "modality": "text",
+      "response_time": 11.978336095809937,
+      "num_sources": 1,
+      "response_length": 7412,
+      "relevance_score": 5.0,
+      "completeness_score": 3.5,
+      "accuracy_score": 4.7,
+      "timestamp": "2025-11-22T23:23:30.759116"
+    },
+    {
+      "query_id": "text_005",
+      "query_text": "What structural reforms are being implemented in Qatar?",
+      "modality": "text",
+      "response_time": 11.726698875427246,
+      "num_sources": 1,
+      "response_length": 6193,
+      "relevance_score": 5.0,
+      "completeness_score": 3.5,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:23:42.486188"
+    },
+    {
+      "query_id": "table_001",
+      "query_text": "What does Table 1 on Qatar's Selected Macroeconomic Indicators show for 2021-2025?",
+      "modality": "table",
+      "response_time": 19.15619444847107,
+      "num_sources": 3,
+      "response_length": 7649,
+      "relevance_score": 5.0,
+      "completeness_score": 4.5,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:24:01.643747"
+    },
+    {
+      "query_id": "table_002",
+      "query_text": "Analyze the production and prices indicators in the macroeconomic table",
+      "modality": "table",
+      "response_time": 10.083439826965332,
+      "num_sources": 2,
+      "response_length": 2791,
+      "relevance_score": 5.0,
+      "completeness_score": 4.0,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:24:11.727824"
+    },
+    {
+      "query_id": "table_003",
+      "query_text": "What are the public finance indicators shown in the table?",
+      "modality": "table",
+      "response_time": 11.546343326568604,
+      "num_sources": 3,
+      "response_length": 4027,
+      "relevance_score": 5.0,
+      "completeness_score": 4.5,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:24:23.274665"
+    },
+    {
+      "query_id": "table_004",
+      "query_text": "Describe the external sector data in the macroeconomic indicators table",
+      "modality": "table",
+      "response_time": 12.04439902305603,
+      "num_sources": 2,
+      "response_length": 4509,
+      "relevance_score": 5.0,
+      "completeness_score": 4.0,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:24:35.319599"
+    },
+    {
+      "query_id": "table_005",
+      "query_text": "What trends do you observe in Qatar's fiscal balance from 2021 to 2025?",
+      "modality": "table",
+      "response_time": 10.7746901512146,
+      "num_sources": 2,
+      "response_length": 3646,
+      "relevance_score": 5.0,
+      "completeness_score": 4.0,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:24:46.094826"
+    },
+    {
+      "query_id": "chart_001",
+      "query_text": "What does Figure 1 show about Qatar's economic performance?",
+      "modality": "chart",
+      "response_time": 4.783807754516602,
+      "num_sources": 2,
+      "response_length": 935,
+      "relevance_score": 4.0,
+      "completeness_score": 3.5,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:24:50.879738"
+    },
+    {
+      "query_id": "chart_002",
+      "query_text": "Describe the visual representation of Qatar's fiscal position in the charts",
+      "modality": "chart",
+      "response_time": 7.957418918609619,
+      "num_sources": 3,
+      "response_length": 2672,
+      "relevance_score": 4.0,
+      "completeness_score": 4.5,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:24:58.837392"
+    },
+    {
+      "query_id": "chart_003",
+      "query_text": "What insights can be drawn from the graphical representation of external sector data?",
+      "modality": "chart",
+      "response_time": 11.488693952560425,
+      "num_sources": 2,
+      "response_length": 4162,
+      "relevance_score": 5.0,
+      "completeness_score": 4.0,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:25:10.326538"
+    },
+    {
+      "query_id": "chart_004",
+      "query_text": "Analyze the inflation trends shown in the charts",
+      "modality": "chart",
+      "response_time": 7.67470121383667,
+      "num_sources": 3,
+      "response_length": 2233,
+      "relevance_score": 5.0,
+      "completeness_score": 4.5,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:25:18.002728"
+    },
+    {
+      "query_id": "chart_005",
+      "query_text": "What does the chart show about Qatar's LNG production and hydrocarbon sector?",
+      "modality": "chart",
+      "response_time": 8.185863733291626,
+      "num_sources": 2,
+      "response_length": 1659,
+      "relevance_score": 5.0,
+      "completeness_score": 4.0,
+      "accuracy_score": 5.0,
+      "timestamp": "2025-11-22T23:25:26.188740"
+    }
+  ]
+}
