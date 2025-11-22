@@ -8,7 +8,7 @@ import numpy as np
 import requests
 import gradio as gr
 import qdrant_client
-import uuid  # <--- MOVED TO TOP TO FIX UnboundLocalError
+import uuid
 from typing import List, Dict, Any
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -284,13 +284,15 @@ class AsyncContextRAG:
 
         query_vec = list(self.embed_model.embed([user_query]))[0].tolist()
         
+        # FIX: await the coroutine first, THEN access .points
         try:
             # Try Modern API (v1.10+)
-            search_results = await self.client.query_points(
+            response = await self.client.query_points(
                 collection_name=COLLECTION_NAME,
                 query=query_vec,
                 limit=25
-            ).points
+            )
+            search_results = response.points
         except AttributeError:
             try:
                 # Try Classic API
@@ -307,7 +309,7 @@ class AsyncContextRAG:
         # Re-Rank
         if FLASHRANK_AVAILABLE and self.reranker:
             passages = [{"id": hit.id, "text": hit.payload["text"], "meta": hit.payload} for hit in search_results]
-            ranked = self.reranker.rank(RerankRequest(query=user_query, passages=passages))
+            ranked = self.reranker.rerank(RerankRequest(query=user_query, passages=passages))
             top_context = ranked[:5]
         else:
             top_context = search_results[:5]
