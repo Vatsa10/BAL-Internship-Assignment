@@ -295,6 +295,10 @@ class AsyncDoclingRAG:
         dense_vec = list(self.dense_model.embed([text]))[0].tolist()
         sparse_vec = list(self.sparse_model.embed([text]))[0].as_object()
         
+        # Detect if query is about tables for enhanced retrieval
+        is_table_query = any(keyword in text.lower() for keyword in ["table", "macroeconomic", "indicators", "data"])
+        limit_size = 25 if is_table_query else 20
+        
         # 1. Hybrid Retrieval (Increased limit to catch specific figures)
         response = await self.client.query_points(
             collection_name=COLLECTION_NAME,
@@ -303,7 +307,7 @@ class AsyncDoclingRAG:
                 Prefetch(query=sparse_vec, using="sparse", limit=30),
             ],
             query=FusionQuery(fusion=Fusion.RRF),
-            limit=20
+            limit=limit_size
         )
         hits = response.points
         if not hits: return "No data found.", []
@@ -312,9 +316,9 @@ class AsyncDoclingRAG:
         if FLASHRANK_AVAILABLE and self.reranker:
             passages = [{"id": h.id, "text": h.payload["text"], "meta": h.payload} for h in hits]
             ranked = self.reranker.rerank(RerankRequest(query=text, passages=passages))
-            top_hits = ranked[:7] # Increased context window
+            top_hits = ranked[:10] if is_table_query else ranked[:7] # More context for tables
         else:
-            top_hits = hits[:7]
+            top_hits = hits[:10] if is_table_query else hits[:7]
 
         # 3. Formatting
         ctx_parts = []
@@ -337,7 +341,7 @@ class AsyncDoclingRAG:
 
         ctx = "\n".join(ctx_parts)
         
-        # 4. Strict Persona Prompt
+        # 4. Strict Persona Prompt with Enhanced Table Analysis
         prompt = f"""
         You are a Senior Financial Analyst evaluating an IMF Article IV report.
         
@@ -347,12 +351,26 @@ class AsyncDoclingRAG:
         3. If the user asks for targets or numbers (e.g., "7 strategic outcomes"), list them exactly as they appear.
         4. Do NOT summarize vaguely. Extract specific data points, percentages, and years.
         5. If the context contains a Chart Analysis, treat it as factual data from the report.
+        6. **FOR TABLES**: Provide comprehensive analysis including:
+           - What the table measures and its significance
+           - Key trends across the time period (historical vs. projections)
+           - Notable changes or anomalies in the data
+           - Comparative analysis between different indicators
+           - Economic implications of the trends shown
+           - Sector-specific insights (if applicable)
         
         CONTEXT:
         {ctx}
         
         QUESTION: 
         {text}
+        
+        RESPONSE FORMAT:
+        - Start with a brief overview of what the table represents
+        - Provide detailed analysis of key indicators and trends
+        - Highlight significant changes or patterns
+        - Explain the economic implications
+        - Include specific numbers and percentages from the table
         """
         
         res = await self.gemini_model.generate_content_async(prompt)
