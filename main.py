@@ -21,6 +21,7 @@ import fitz  # PyMuPDF
 import io
 import shutil
 import requests
+import re
 from pathlib import Path
 from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
@@ -34,7 +35,7 @@ from docling.datamodel.base_models import InputFormat
 from docling.chunking import HybridChunker 
 
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import PointStruct, VectorParams, Distance, SparseVectorParams
+from qdrant_client.models import PointStruct, VectorParams, Distance, SparseVectorParams, FusionQuery, Fusion, Prefetch
 from fastembed import TextEmbedding, SparseTextEmbedding # Hybrid Search
 import google.generativeai as genai
 
@@ -51,7 +52,9 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-COLLECTION_NAME = "docling_financial"
+
+# FIX: New Collection Name to enforce Multi-Vector Schema
+COLLECTION_NAME = "docling_financial_hybrid_v2"
 
 if not GEMINI_API_KEY: raise ValueError("❌ GEMINI_API_KEY missing")
 
@@ -81,7 +84,7 @@ class AsyncDoclingRAG:
         
         # HYBRID SEARCH MODELS
         self.dense_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-        self.sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25") # BM25 for Keyword Search
+        self.sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25") 
         
         self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
         self.sem = asyncio.Semaphore(10) 
@@ -93,7 +96,7 @@ class AsyncDoclingRAG:
             self.reranker = None
 
         print("🔄 Initializing Docling...")
-        # get_docling_converter() # Lazy load prevents startup freeze
+        # get_docling_converter() # Lazy load
         print("✅ Advanced RAG System Initialized.")
 
     async def check_database(self) -> str:
@@ -104,12 +107,13 @@ class AsyncDoclingRAG:
                     return f"### ✅ Ready\n**Collection:** `{COLLECTION_NAME}`\n**Vectors:** {cnt}\n*Hybrid Search Enabled*"
                 else:
                     return f"### ⚠️ Empty\nCollection `{COLLECTION_NAME}` exists but is empty."
-            return f"### ❌ Not Found\nCollection `{COLLECTION_NAME}` missing."
+            return f"### ❌ Not Found\nCollection `{COLLECTION_NAME}` missing. Please ingest."
         except Exception as e:
             return f"### ❌ Error\n{str(e)}"
 
     async def initialize_db(self):
         if not await self.client.collection_exists(COLLECTION_NAME):
+            print(f"⚙️ Creating Multi-Vector Collection: {COLLECTION_NAME}")
             await self.client.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config={
@@ -171,19 +175,18 @@ class AsyncDoclingRAG:
         final_points = []
         # Add Text
         for c in text_chunks:
-            final_points.append({"text": c["text"], "type": "text", "source": "docling"})
+            final_points.append({"text": c["text"], "type": "text", "source": "docling", "metadata": c["metadata"]})
         # Add Charts
         for desc in img_descs:
-            if desc: final_points.append({"text": desc, "type": "chart", "source": "vision"})
+            if desc: final_points.append({"text": desc, "type": "chart", "source": "vision", "metadata": {}})
 
         if not final_points: return "⚠️ No content."
 
         progress(0.7, desc="Generating Hybrid Embeddings...")
         texts = [p["text"] for p in final_points]
         
-        # Dense Embeddings
-        dense_vecs = list(self.embed_model.embed(texts))
-        # Sparse Embeddings (BM25)
+        # Generate embeddings
+        dense_vecs = list(self.dense_model.embed(texts))
         sparse_vecs = list(self.sparse_model.embed(texts))
         
         points = []
@@ -210,25 +213,24 @@ class AsyncDoclingRAG:
         sparse_vec = list(self.sparse_model.embed([text]))[0].as_object()
         
         # 2. Hybrid Retrieval (Qdrant Prefetch)
-        # We fetch 20 results from Dense and 20 from Sparse
         response = await self.client.query_points(
             collection_name=COLLECTION_NAME,
             prefetch=[
-                qdrant_client.models.Prefetch(query=dense_vec, using="dense", limit=20),
-                qdrant_client.models.Prefetch(query=sparse_vec, using="sparse", limit=20),
+                Prefetch(query=dense_vec, using="dense", limit=20),
+                Prefetch(query=sparse_vec, using="sparse", limit=20),
             ],
-            query=qdrant_client.models.FusionQuery(fusion=qdrant_client.models.Fusion.RRF),
-            limit=20 # Get top 20 fused results
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=20 
         )
         
         hits = response.points
         if not hits: return "No data found.", []
 
-        # 3. Cross-Encoder Reranking (FlashRank)
+        # 3. Cross-Encoder Reranking
         if FLASHRANK_AVAILABLE and self.reranker:
             passages = [{"id": h.id, "text": h.payload["text"], "meta": h.payload} for h in hits]
             ranked = self.reranker.rerank(RerankRequest(query=text, passages=passages))
-            top_hits = ranked[:5] # Top 5 most relevant
+            top_hits = ranked[:5] 
         else:
             top_hits = hits[:5]
 
@@ -236,16 +238,14 @@ class AsyncDoclingRAG:
         ctx_parts = []
         citations = []
         for h in top_hits:
-            # Handle FlashRank dict vs Qdrant object differences
             payload = h["meta"] if isinstance(h, dict) else h.payload
             text_content = h["text"] if isinstance(h, dict) else h.payload["text"]
             
-            # Docling Metadata often nested
+            # Metadata extraction
             meta = payload.get("metadata", {})
-            # Try to find page number deep in metadata
             page = meta.get("page_no", "?") 
             if page == "?":
-                # Try identifying form image text "Chart on Page X"
+                # Regex fallback for images if page isn't in metadata
                 m = re.search(r"Page (\d+)", text_content)
                 if m: page = m.group(1)
 
@@ -263,66 +263,78 @@ class AsyncDoclingRAG:
         res = await self.gemini_model.generate_content_async(prompt)
         return res.text, list(set(citations))
 
-    # --- SUMMARIZATION / BRIEFING AGENT ---
+    # --- SUMMARIZATION ---
     async def generate_briefing(self):
-        """Generates an executive summary of the entire document."""
-        # Retrieve diverse chunks from the whole document (random sampling or broad search)
-        # Since we can't context window the whole PDF, we take top 50 chunks from a generic query
-        dense_vec = list(self.embed_model.embed(["Overview of financial performance and risks"]))[0].tolist()
+        # 1. Broad Retrieval
+        dense_vec = list(self.dense_model.embed(["Overview of financial performance and risks"]))[0].tolist()
         
-        hits = await self.client.search(
+        # FIX: Use query_points with "using='dense'" to avoid schema mismatch
+        response = await self.client.query_points(
             collection_name=COLLECTION_NAME,
-            query_vector=("dense", dense_vec),
+            query=dense_vec,
+            using="dense",
             limit=30
         )
+        hits = response.points
         
+        if not hits: return "⚠️ No data available to summarize."
+
         summary_ctx = "\n".join([h.payload["text"] for h in hits])
         
         prompt = f"""
         Role: Senior Economic Advisor.
-        Task: Write an Executive Briefing based on these excerpts from a report.
+        Task: Write an Executive Briefing based on these excerpts.
         Structure:
-        1. Executive Summary (3 bullet points)
-        2. Key Financial Indicators (Table format if possible)
-        3. Major Risks & Outlook
+        1. Executive Summary
+        2. Key Indicators (Table)
+        3. Risks & Outlook
         
         Excerpts:
-        {summary_ctx[:30000]}  # Limit context to avoid overflow
+        {summary_ctx[:30000]}
         """
         
         res = await self.gemini_model.generate_content_async(prompt)
         return res.text
 
 # --- UI & SINGLETON ---
+
 _rag_instance = None
+
 def get_rag():
     global _rag_instance
-    if _rag_instance is None: _rag_instance = AsyncDoclingRAG()
+    if _rag_instance is None:
+        _rag_instance = AsyncDoclingRAG()
     return _rag_instance
 
-async def update_status():
-    return await get_rag().check_database()
-
-async def run_ingest(f, u):
+async def update_status_on_load():
     rag = get_rag()
-    path = ""
-    if u:
-        r = requests.get(u)
-        with open("download.pdf", "wb") as f_d: f_d.write(r.content)
-        path = "download.pdf"
-    elif f: path = f.name
-    else: return "No input."
+    return await rag.check_database()
+
+async def run_ingest(file, url):
+    rag = get_rag()
+    if url:
+        try:
+            r = requests.get(url)
+            if r.status_code == 200:
+                with open("download.pdf", "wb") as f: f.write(r.content)
+                path = "download.pdf"
+            else: return f"Error: Status {r.status_code}"
+        except Exception as e: return f"Download Error: {e}"
+    elif file:
+        path = file.name
+    else:
+        return "Please provide file or URL."
     
-    res = await rag.ingest(path)
-    stat = await rag.check_database()
-    return res, stat
+    result = await rag.ingest(path)
+    status = await rag.check_database()
+    return result, status
 
-async def chat_fn(msg, h):
+async def chat_wrapper(message, history):
     rag = get_rag()
-    ans, cits = await rag.query(msg)
-    return f"{ans}\n\n📚 **Refs:** {', '.join(cits)}"
+    response_text, _ = await rag.query(message)
+    return response_text
 
-async def briefing_fn():
+async def briefing_wrapper():
     rag = get_rag()
     return await rag.generate_briefing()
 
@@ -330,25 +342,30 @@ async def briefing_fn():
 with gr.Blocks(title="Advanced Docling RAG") as demo:
     gr.Markdown("# 🚀 Advanced Financial RAG (Hybrid + RRF + Summarization)")
     
-    stat = gr.Markdown("🔄 Checking...")
-    demo.load(update_status, outputs=[stat])
+    # STATUS BOX
+    status_box = gr.Markdown("🔄 Checking Knowledge Base...")
+    demo.load(update_status_on_load, outputs=[status_box])
     
     with gr.Tab("💬 Chat & Search"):
-        with gr.Accordion("Data Ingestion", open=False):
+        with gr.Accordion("📂 Data Ingestion", open=False):
             with gr.Row():
                 f_in = gr.File(label="PDF")
                 u_in = gr.Textbox(label="URL")
             btn = gr.Button("Ingest")
             out = gr.Textbox(label="Result")
-            btn.click(run_ingest, [f_in, u_in], [out, stat])
+            
+            btn.click(run_ingest, [f_in, u_in], [out, status_box])
         
-        gr.ChatInterface(fn=chat_fn, type="messages")
+        gr.ChatInterface(
+            fn=chat_wrapper,
+            type="messages"
+        )
 
     with gr.Tab("📝 Executive Briefing"):
         gr.Markdown("Generate a comprehensive summary of the ingested document.")
         brief_btn = gr.Button("Generate Briefing", variant="primary")
         brief_out = gr.Markdown()
-        brief_btn.click(briefing_fn, outputs=[brief_out])
+        brief_btn.click(briefing_wrapper, outputs=[brief_out])
 
 if __name__ == "__main__":
     demo.launch()
