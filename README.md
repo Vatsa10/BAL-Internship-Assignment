@@ -4,8 +4,8 @@ A high-performance, local-first Retrieval Augmented Generation (RAG) system desi
 
 This repository contains two distinct pipeline implementations optimized for different needs:
 
-- **app.py (Standard Pipeline)**: Optimized for speed, custom chunking, and re-ranking.
-- **main.py (Docling Pipeline)**: Optimized for complex layout parsing and high-fidelity table extraction.
+- **app.py (Standard Pipeline)**: Optimized for speed, custom chunking, and re-ranking. Best for text-heavy documents.
+- **main.py (Docling Pipeline)**: Optimized for complex layout parsing, cross-modal retrieval, and high-fidelity table extraction. Best for documents with complex layouts and tables.
 
 ## Pipeline Comparison
 
@@ -14,18 +14,62 @@ This repository contains two distinct pipeline implementations optimized for dif
 | **Parsing Engine** | PyMuPDF + PaddleOCR | IBM Docling (SOTA Layout Analysis) |
 | **Chunking Strategy** | Context-Aware Sentence Windowing | Hybrid Semantic Chunking |
 | **Table Handling** | Text-based heuristics + Markdown conversion | Structure-aware TableFormer models |
-| **Re-Ranking** | Yes (FlashRank) | No (Relies on Docling's high-quality chunks) |
-| **Speed** | Very Fast | Slower (Heavy ML models for layout) |
-| **Vector Collection** | `imf_policy_reports_final_v4_3` | `docling_financial` |
-| **Best For** | Text-heavy policy docs, huge archives. | Docs with complex columns, headers, & tables. |
+| **Re-Ranking** | FlashRank (Text-only) | FlashRank (Cross-modal) |
+| **Retrieval** | Dense vectors (BAAI/bge-small-en-v1.5) | Hybrid: Dense + Sparse (RRF Fusion) |
+| **Vision Integration** | Chart analysis via Gemini VLM | Chart analysis + Caption extraction |
+| **Speed** | Very Fast | Moderate (Heavy ML models for layout) |
+| **Vector Collection** | `imf_policy_reports_final_v4_3` | `docling_financial_context_v4` |
+| **Best For** | Text-heavy policy docs, huge archives | Docs with complex columns, headers, tables |
+| **Evaluation** | Basic metrics | Comprehensive multi-modality evaluation |
 
 ## Tech Stack
 
 - **Frontend**: Gradio (Async Web UI)
 - **Vector Database**: Qdrant (Cloud or Local Docker)
-- **Embeddings**: FastEmbed (BAAI/bge-small-en-v1.5) - Runs locally on CPU.
-- **LLM / VLM**: Google Gemini 2.0 Flash (Free Tier) - Handles Text & Image reasoning.
-- **Infrastructure**: Fully Async (`asyncio` + `ProcessPoolExecutor`/`ThreadPoolExecutor`).
+- **Embeddings**: FastEmbed (BAAI/bge-small-en-v1.5 for dense, Qdrant/bm25 for sparse)
+- **LLM / VLM**: Google Gemini 2.0 Flash (Free Tier) - Handles Text & Image reasoning
+- **Re-Ranking**: FlashRank (ms-marco-MiniLM-L-12-v2) - Cross-modal relevance scoring
+- **Layout Analysis**: IBM Docling (main.py only) - SOTA document understanding
+- **Infrastructure**: Fully Async (`asyncio` + `ThreadPoolExecutor`)
+
+## Advanced Features
+
+### Docling Pipeline (main.py)
+
+**Cross-Modal Retrieval & Reranking:**
+- Hybrid search combining dense embeddings and sparse BM25 vectors
+- Reciprocal Rank Fusion (RRF) for optimal result fusion
+- FlashRank cross-modal reranking for improved relevance
+- Vision-text integration: Charts analyzed and indexed alongside text
+
+**Retrieval Fine-Tuning:**
+- Adaptive retrieval limits based on query type (text/table/chart)
+- Context-aware chunking with semantic boundaries
+- Sticky headers to preserve document structure
+- Caption extraction for figures and tables
+
+**Summarization & Briefing:**
+- Executive briefing generation from top-ranked documents
+- Structured output: Outlook, Risks, Policy Recommendations
+- Query-specific response formatting (table/chart/text)
+
+**Multi-Modality Support:**
+- Text extraction with layout preservation
+- Table structure recognition via TableFormer
+- Chart/figure analysis with caption context
+- Image-text fusion for comprehensive understanding
+
+### Standard Pipeline (app.py)
+
+**Fast Re-Ranking:**
+- FlashRank for text-only relevance scoring
+- Sentence window chunking with overlap
+- Parallel OCR and vision processing
+
+**Efficient Processing:**
+- ProcessPoolExecutor for CPU-bound tasks
+- Concurrent image analysis and text extraction
+- Query result caching for repeated queries
 
 ## Prerequisites
 
@@ -72,9 +116,10 @@ python app.py
 ```
 
 **Key Features:**
-- Uses **FlashRank** to re-order search results for higher accuracy.
-- Uses **PaddleOCR** for scanned pages.
-- Uses a **Sliding Window** approach (Page 1 Policy Text...) to keep context.
+- Uses **FlashRank** to re-order search results for higher accuracy
+- Uses **PaddleOCR** for scanned pages
+- Uses a **Sliding Window** approach to keep context
+- Optimized for speed and throughput
 
 ### Option 2: Docling Pipeline (Layout Master)
 
@@ -85,56 +130,69 @@ python main.py
 ```
 
 **Key Features:**
-- Uses **IBM's Docling models** to understand the visual layout of the PDF.
-- Extracts tables structurally (not just as text).
-- **Hybrid pipeline**: Uses Docling for structure + PyMuPDF for fast image extraction.
+- Uses **IBM's Docling models** to understand the visual layout of the PDF
+- Extracts tables structurally (not just as text)
+- **Hybrid retrieval**: Dense + Sparse vectors with RRF fusion
+- **Cross-modal reranking**: FlashRank scores text-image relevance
+- **Adaptive prompts**: Tailored responses for tables, charts, and text queries
 
-## Architecture Overview
+## Evaluation & Benchmarking
 
-```mermaid
-graph TD
-    User[User Upload] --> Router{Select Pipeline}
-    
-    subgraph "Standard Pipeline (app.py)"
-        P1[PyMuPDF] --> Text[Sentence Window Chunking]
-        P1 --> OCR[PaddleOCR (Scans)]
-        P1 --> Img1[Gemini VLM (Charts)]
-        Text & OCR & Img1 --> Embed1[FastEmbed]
-        Embed1 --> Q1[(Qdrant Collection: imf_policy_reports_final_v4_3)]
-        Search1[Vector Search] --> Rank[FlashRank Re-Ranking]
-    end
-    
-    subgraph "Docling Pipeline (main.py)"
-        D1[Docling Converter] --> Layout[Layout & Table Analysis]
-        Layout --> Hybrid[Hybrid Chunking]
-        D1 --> Img2[Gemini VLM (Charts)]
-        Hybrid & Img2 --> Embed2[FastEmbed]
-        Embed2 --> Q2[(Qdrant Collection: docling_financial)]
-    end
-    
-    Router --> P1
-    Router --> D1
-    
-    Rank --> LLM[Gemini Flash Analyst]
-    Q2 --> LLM
-    LLM --> Answer[Final Response]
+The Docling pipeline includes a comprehensive evaluation suite for benchmarking performance across multiple modalities.
+
+### Running Evaluations
+
+**1. Ingest a test document:**
+```bash
+python main.py
+# Upload qatar_test_doc.pdf in the Ingest tab
 ```
 
-## Troubleshooting
+**2. Run evaluation suite:**
+```bash
+python evaluate_rag.py
+```
 
-1. **`OSError: [WinError 1314] A required privilege is not held by the client`**
-   - **Cause**: Docling needs to create symbolic links to cache AI models.
-   - **Fix**: Run your terminal/VS Code as **Administrator** or enable **Developer Mode** in Windows Settings. The code attempts to mitigate this using environment variables (`HF_HUB_DISABLE_SYMLINKS`), but permissions may still be required on some systems.
+This runs 15 evaluation queries across 3 modalities:
+- **Text queries (5)**: Economic challenges, outlook, risks, banking, reforms
+- **Table queries (5)**: Macroeconomic indicators, production, finance, external sector, trends
+- **Chart queries (5)**: Economic performance, fiscal position, external trends, inflation, LNG sector
 
-2. **`SSL: CERTIFICATE_VERIFY_FAILED`**
-   - **Cause**: Corporate firewalls or missing certificates when downloading models from Hugging Face.
-   - **Fix**: Both scripts include automatic patches (`HF_HUB_DISABLE_SSL_VERIFY`) to bypass this. If it persists, check your VPN/Proxy settings.
+**3. Diagnose text query performance:**
+```bash
+python diagnose_text_queries.py
+```
 
-3. **`No module named 'paddle'`**
-   - **Cause**: You installed `paddleocr` but missed the engine.
-   - **Fix**: Run `pip install paddlepaddle`.
+Shows keyword matching rates, response quality, and recommendations for improvement.
 
-4. **Ingestion hangs or is slow**
-   - **Solution**:
-     - `app.py` uses massive parallelism (OCR + Vision + Text all run concurrently).
-     - `main.py` is heavier. Be patient on the first run as it downloads models (~500MB).
+### Evaluation Metrics
+
+**Response Time:**
+- Average, Median, Min, Max response times
+- Per-modality breakdown
+
+**Quality Scores (1-5 scale):**
+- **Relevance**: Keyword presence and semantic alignment
+- **Completeness**: Response depth and source count
+- **Accuracy**: Response structure and factual correctness
+
+**Retrieval Metrics:**
+- Average sources retrieved
+- Average response length
+- Per-modality performance
+
+### Output Files
+
+- `benchmark_results.json` - Raw evaluation data with detailed metrics
+- Modality-specific performance breakdown
+- Recommendations for optimization
+
+### Performance Targets
+
+| Metric | Target | Acceptable |
+| :--- | :--- | :--- |
+| Response Time | < 2s | < 5s |
+| Relevance Score | > 4.2/5 | > 3.5/5 |
+| Completeness Score | > 4.0/5 | > 3.5/5 |
+| Accuracy Score | > 4.1/5 | > 3.5/5 |
+| Avg Sources | > 4 | > 3 |
