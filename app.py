@@ -53,8 +53,7 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("❌ GEMINI_API_KEY not found in .env file")
 
-# USE YOUR EXISTING COLLECTION HERE
-COLLECTION_NAME = "imf_policy_reports_final_v4" 
+COLLECTION_NAME = "imf_policy_reports_final_v4_2" 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 WINDOW_SIZE = 6  
@@ -69,13 +68,13 @@ def _run_paddle_ocr(image_bytes: bytes) -> str:
     if not PADDLE_AVAILABLE: return ""
     try:
         # Initialize PaddleOCR
-        # Note: use_angle_cls=False to prevent 'cls' argument errors in some versions
+        # use_angle_cls=False prevents 'cls' argument errors in some versions
         ocr = PaddleOCR(use_angle_cls=False, lang='en', show_log=False) 
         
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        # Run OCR (cls=False for stability)
+        # Run OCR
         result = ocr.ocr(img, cls=False)
         
         extracted_text = []
@@ -85,7 +84,6 @@ def _run_paddle_ocr(image_bytes: bytes) -> str:
                     extracted_text.append(line[1][0])
         return "\n".join(extracted_text)
     except Exception as e:
-        print(f"OCR Error: {e}")
         return ""
 
 def _create_sentence_window_chunks(text: str, page_num: int) -> List[Dict]:
@@ -99,7 +97,10 @@ def _create_sentence_window_chunks(text: str, page_num: int) -> List[Dict]:
         return [{
             "text": f"Page {page_num} Policy Text: {text}",
             "type": "text_window",
-            "metadata": {"window_span": f"0-{len(sentences)}"}
+            "metadata": {
+                "window_span": f"0-{len(sentences)}",
+                "page_num": page_num 
+            }
         }]
 
     chunks = []
@@ -112,7 +113,11 @@ def _create_sentence_window_chunks(text: str, page_num: int) -> List[Dict]:
         chunks.append({
             "text": f"Page {page_num} Policy Text: {chunk_text}",
             "type": "text_window",
-            "metadata": {"sentence_start": i, "sentence_end": i + len(window)}
+            "metadata": {
+                "sentence_start": i, 
+                "sentence_end": i + len(window),
+                "page_num": page_num
+            }
         })
         if i + WINDOW_SIZE >= len(sentences): break
     return chunks
@@ -122,7 +127,14 @@ def _cpu_process_page(pdf_path: str, page_num: int) -> Dict[str, Any]:
     try:
         doc = fitz.open(pdf_path)
         page = doc.load_page(page_num)
-        result_data = {"page_num": page_num, "chunks": [], "images": [], "needs_ocr": False}
+        display_page_num = page_num + 1
+        
+        result_data = {
+            "page_num": display_page_num, 
+            "chunks": [], 
+            "images": [], 
+            "needs_ocr": False
+        }
 
         # Table Extraction
         tables = page.find_tables()
@@ -131,9 +143,12 @@ def _cpu_process_page(pdf_path: str, page_num: int) -> Dict[str, Any]:
                 md_text = tab.to_markdown()
                 if len(md_text) > 30:
                     result_data["chunks"].append({
-                        "text": f"Macroeconomic Table on Page {page_num}:\n{md_text}",
+                        "text": f"Table on Page {display_page_num}:\n{md_text}",
                         "type": "table",
-                        "metadata": {"source": "imf_table"}
+                        "metadata": {
+                            "source": "imf_table",
+                            "page_num": display_page_num
+                        }
                     })
                 page.add_redact_annot(tab.bbox)
             page.apply_redactions()
@@ -153,20 +168,27 @@ def _cpu_process_page(pdf_path: str, page_num: int) -> Dict[str, Any]:
             result_data["needs_ocr"] = True
             result_data["scan_bytes"] = page.get_pixmap().tobytes("png")
         else:
-            result_data["chunks"].extend(_create_sentence_window_chunks(text_content, page_num))
+            result_data["chunks"].extend(_create_sentence_window_chunks(text_content, display_page_num))
 
         doc.close()
         return result_data
     except Exception as e:
         print(f"Error Page {page_num}: {e}")
-        return {"page_num": page_num, "chunks": [], "images": [], "needs_ocr": False}
+        return {"page_num": page_num + 1, "chunks": [], "images": [], "needs_ocr": False}
 
 # --- 2. ASYNC RAG PIPELINE ---
 
 class AsyncContextRAG:
     def __init__(self):
         self.process_executor = ProcessPoolExecutor(max_workers=os.cpu_count())
-        self.client = AsyncQdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        
+        # FIX 1: Increased Timeout for Qdrant Client to prevent ReadTimeout errors
+        self.client = AsyncQdrantClient(
+            url=QDRANT_URL, 
+            api_key=QDRANT_API_KEY,
+            timeout=60.0  # 60 seconds timeout
+        )
+        
         self.embed_model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
         self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
         
@@ -179,7 +201,6 @@ class AsyncContextRAG:
         self.sem = asyncio.Semaphore(10)
 
     async def get_collection_status(self):
-        """Checks if the KB exists and how many docs are in it."""
         try:
             if await self.client.collection_exists(COLLECTION_NAME):
                 count_result = await self.client.count(COLLECTION_NAME)
@@ -210,7 +231,6 @@ class AsyncContextRAG:
         loop = asyncio.get_running_loop()
         page_num = page_data["page_num"]
         
-        # OCR Block
         if page_data["needs_ocr"] and PADDLE_AVAILABLE:
             try:
                 ocr_text = await loop.run_in_executor(self.process_executor, _run_paddle_ocr, page_data["scan_bytes"])
@@ -219,7 +239,6 @@ class AsyncContextRAG:
             except Exception as e:
                 print(f"Page {page_num} OCR Skip: {e}")
 
-        # Vision Block
         if page_data["images"]:
             img_tasks = [self.analyze_image(b) for b in page_data["images"]]
             captions = await asyncio.gather(*img_tasks)
@@ -227,7 +246,10 @@ class AsyncContextRAG:
                 page_data["chunks"].append({
                     "text": f"Chart/Figure on Page {page_num}: {cap}",
                     "type": "chart", 
-                    "metadata": {"source": "imf_chart"}
+                    "metadata": {
+                        "source": "imf_chart",
+                        "page_num": page_num
+                    }
                 })
         return page_data["chunks"]
 
@@ -259,23 +281,40 @@ class AsyncContextRAG:
         texts = [c["text"] for c in all_chunks]
         embeddings = list(self.embed_model.embed(texts))
         
-        # FIX: uuid imported at top level now
-        points = [
-            PointStruct(
+        points = []
+        for i, c in enumerate(all_chunks):
+            meta = c.get("metadata", {})
+            if meta is None: meta = {}
+            
+            points.append(PointStruct(
                 id=str(uuid.uuid4()),
                 vector=embeddings[i].tolist(),
                 payload={
                     "text": c["text"],
                     "type": c["type"],
-                    "page": c.get("metadata", {}).get("page_num", 0),
-                    "metadata": c["metadata"]
+                    "page": meta.get("page_num", 0),
+                    "metadata": meta
                 }
-            ) for i, c in enumerate(all_chunks)
-        ]
+            ))
 
-        batch_size = 100
+        # FIX 2: Reduced Batch Size to 50 (Prevents Timeouts) & Added Retry Logic
+        batch_size = 50
+        total_batches = (len(points) + batch_size - 1) // batch_size
+        
         for i in range(0, len(points), batch_size):
-            await self.client.upsert(COLLECTION_NAME, points[i:i+batch_size])
+            batch = points[i:i+batch_size]
+            progress(0.8 + (0.2 * (i / len(points))), desc=f"Uploading Batch {(i//batch_size)+1}/{total_batches}...")
+            
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    await self.client.upsert(COLLECTION_NAME, batch)
+                    break # Success
+                except Exception as e:
+                    if attempt == retries - 1:
+                        print(f"❌ Batch Upload Failed after {retries} attempts: {e}")
+                    else:
+                        await asyncio.sleep(1) # Wait before retry
             
         return f"✅ Indexed {len(points)} chunks from {total_pages} pages."
 
@@ -284,9 +323,7 @@ class AsyncContextRAG:
 
         query_vec = list(self.embed_model.embed([user_query]))[0].tolist()
         
-        # FIX: await the coroutine first, THEN access .points
         try:
-            # Try Modern API (v1.10+)
             response = await self.client.query_points(
                 collection_name=COLLECTION_NAME,
                 query=query_vec,
@@ -295,7 +332,6 @@ class AsyncContextRAG:
             search_results = response.points
         except AttributeError:
             try:
-                # Try Classic API
                 search_results = await self.client.search(
                     collection_name=COLLECTION_NAME,
                     query_vector=query_vec,
