@@ -35,7 +35,8 @@ from docling.datamodel.base_models import InputFormat
 from docling.chunking import HybridChunker 
 
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import PointStruct, VectorParams, Distance, SparseVectorParams, FusionQuery, Fusion, Prefetch
+# FIX: Added SparseIndexParams to imports
+from qdrant_client.models import PointStruct, VectorParams, Distance, SparseVectorParams, SparseIndexParams, FusionQuery, Fusion, Prefetch
 from fastembed import TextEmbedding, SparseTextEmbedding # Hybrid Search
 import google.generativeai as genai
 
@@ -54,7 +55,7 @@ QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
 # FIX: New Collection Name to enforce Multi-Vector Schema
-COLLECTION_NAME = "docling_financial_hybrid_v2"
+COLLECTION_NAME = "docling_financial_hybrid_v3"
 
 if not GEMINI_API_KEY: raise ValueError("❌ GEMINI_API_KEY missing")
 
@@ -120,7 +121,8 @@ class AsyncDoclingRAG:
                     "dense": VectorParams(size=384, distance=Distance.COSINE)
                 },
                 sparse_vectors_config={
-                    "sparse": SparseVectorParams(index=True)
+                    # FIX: Correct syntax for Sparse Vectors
+                    "sparse": SparseVectorParams(index=SparseIndexParams(on_disk=False))
                 }
             )
 
