@@ -2,10 +2,8 @@ import os
 import sys
 
 # --- FIX 1: WINDOWS COMPATIBILITY CONFIGURATION (MUST BE FIRST) ---
-# 1. Disable SSL Verification (Fixes "CERTIFICATE_VERIFY_FAILED")
 os.environ["HF_HUB_DISABLE_SSL_VERIFY"] = "1"
 os.environ["CURL_CA_BUNDLE"] = ""
-# 2. Disable Symbolic Links (Fixes "WinError 1314" / Developer Mode requirement)
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1" 
 
 import ssl
@@ -22,6 +20,7 @@ import uuid
 import fitz  # PyMuPDF
 import io
 import shutil
+import requests
 from pathlib import Path
 from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
@@ -68,7 +67,7 @@ class AsyncDoclingRAG:
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=4)
         
-        # Qdrant Client with Timeout Fix
+        # Qdrant Client
         self.client = AsyncQdrantClient(
             url=QDRANT_URL, 
             api_key=QDRANT_API_KEY, 
@@ -79,10 +78,29 @@ class AsyncDoclingRAG:
         self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
         self.sem = asyncio.Semaphore(10) 
 
-        # Warmup Docling (Triggers download in main thread to catch errors)
+        # Warmup Docling
         print("🔄 Initializing Docling (This may download models on first run)...")
-        get_docling_converter()
-        print("✅ Docling Ready.")
+        # We don't call it here to allow lazy loading, preventing startup crashes
+        # get_docling_converter() 
+        print("✅ RAG System Initialized.")
+
+    async def check_database(self) -> str:
+        """Checks if the collection exists and has data."""
+        try:
+            print(f"🔍 Checking Qdrant collection: {COLLECTION_NAME}...")
+            if await self.client.collection_exists(COLLECTION_NAME):
+                count_result = await self.client.count(COLLECTION_NAME)
+                cnt = count_result.count
+                print(f"✅ Collection found with {cnt} vectors.")
+                
+                if cnt > 0:
+                    return f"### ✅ Knowledge Base Ready\n**Collection:** `{COLLECTION_NAME}`\n**Vectors Loaded:** {cnt}\n\n*System is ready for chat. No ingestion needed.*"
+                else:
+                    return f"### ⚠️ Knowledge Base Empty\nCollection `{COLLECTION_NAME}` exists but has 0 vectors.\nPlease ingest a document."
+            else:
+                return f"### ❌ Knowledge Base Not Found\nCollection `{COLLECTION_NAME}` does not exist.\nPlease upload a PDF to create it."
+        except Exception as e:
+            return f"### ❌ Connection Error\nCould not connect to Qdrant.\nError: {str(e)}"
 
     async def initialize_db(self):
         if not await self.client.collection_exists(COLLECTION_NAME):
@@ -141,6 +159,7 @@ class AsyncDoclingRAG:
         progress(0.1, desc="Parsing Structure (Docling) & Images...")
         
         try:
+            # Run heavyweight tasks in parallel threads
             docling_future = loop.run_in_executor(self.executor, self._run_docling, pdf_path)
             images_future = loop.run_in_executor(self.executor, self._extract_images_fast, pdf_path)
             
@@ -192,7 +211,10 @@ class AsyncDoclingRAG:
 
     async def query(self, text: str):
         vec = list(self.embed_model.embed([text]))[0].tolist()
-        hits = await self.client.query_points(COLLECTION_NAME, query=vec, limit=10).points
+        
+        # FIX: Await the response object FIRST, then access .points
+        response = await self.client.query_points(COLLECTION_NAME, query=vec, limit=10)
+        hits = response.points
         
         ctx = "\n\n".join([f"[Type: {h.payload.get('type', 'text')}]\n{h.payload['text']}" for h in hits])
         
@@ -200,40 +222,67 @@ class AsyncDoclingRAG:
         res = await self.gemini_model.generate_content_async(prompt)
         return res.text, []
 
-# --- UI ---
-try:
-    rag = AsyncDoclingRAG()
-except RuntimeError as e:
-    print(f"\n❌ FATAL ERROR: {e}\n")
-    sys.exit(1)
+# --- UI & SINGLETON ---
+
+_rag_instance = None
+
+def get_rag():
+    global _rag_instance
+    if _rag_instance is None:
+        _rag_instance = AsyncDoclingRAG()
+    return _rag_instance
+
+async def update_status_on_load():
+    rag = get_rag()
+    return await rag.check_database()
 
 async def run_ingest(file, url):
+    rag = get_rag()
     if url:
-        r = requests.get(url)
-        with open("download.pdf", "wb") as f: f.write(r.content)
-        path = "download.pdf"
+        try:
+            r = requests.get(url)
+            if r.status_code == 200:
+                with open("download.pdf", "wb") as f: f.write(r.content)
+                path = "download.pdf"
+            else: return f"Error: Status {r.status_code}"
+        except Exception as e: return f"Download Error: {e}"
     elif file:
         path = file.name
     else:
         return "Please provide file or URL."
-    return await rag.ingest(path)
+    
+    result = await rag.ingest(path)
+    # Update status after ingest
+    status = await rag.check_database()
+    return result, status
 
+async def chat_wrapper(message, history):
+    rag = get_rag()
+    response_text, _ = await rag.query(message)
+    return response_text
+
+# --- LAYOUT ---
 with gr.Blocks(title="Fast Docling RAG") as demo:
     gr.Markdown("## 🚀 Fast Docling RAG (Hybrid Pipeline)")
     
-    with gr.Accordion("Data Ingestion"):
+    # STATUS BOX
+    status_box = gr.Markdown("🔄 Checking Knowledge Base...")
+    demo.load(update_status_on_load, outputs=[status_box])
+    
+    with gr.Accordion("📂 Data Ingestion", open=False):
         with gr.Row():
             f_in = gr.File(label="PDF")
             u_in = gr.Textbox(label="URL")
         btn = gr.Button("Ingest")
-        out = gr.Textbox(label="Status")
+        out = gr.Textbox(label="Result")
+        
+        # Updates both result box and status box
+        btn.click(run_ingest, [f_in, u_in], [out, status_box])
     
     chat = gr.ChatInterface(
-        fn=lambda m, h: asyncio.run(rag.query(m)) if asyncio.get_event_loop().is_running() else rag.query(m)[0],
+        fn=chat_wrapper,
         type="messages"
     )
-    
-    btn.click(run_ingest, [f_in, u_in], out)
 
 if __name__ == "__main__":
     demo.launch()
