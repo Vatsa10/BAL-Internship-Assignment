@@ -1,141 +1,140 @@
-# # Financial Policy Analyst RAG (Asynchronous & Multi-Modal)
+# Multi-Modal Financial RAG Pipelines
 
-A high-performance Retrieval Augmented Generation (RAG) system designed for analyzing complex financial documents including IMF Article IV Reports and Central Bank Policy Papers. This tool leverages natural language processing and computer vision to extract, process, and generate insights from various document formats.
+A high-performance, local-first Retrieval Augmented Generation (RAG) system designed for complex Financial and Policy documents (e.g., IMF Article IV Reports).
 
-## Features
+This repository contains two distinct pipeline implementations optimized for different needs:
 
-- **Multi-modal Document Processing**: Handles text, tables, and images within documents
-- **Asynchronous Processing**: Efficiently processes large documents
-- **Local-First Architecture**: Maintains document privacy with local processing (except for LLM calls)
-- **Financial Document Specialization**: Optimized for financial and policy documents
-- **Interactive Web Interface**: User-friendly interface for document management and queries
+- **app.py (Standard Pipeline)**: Optimized for speed, custom chunking, and re-ranking.
+- **main.py (Docling Pipeline)**: Optimized for complex layout parsing and high-fidelity table extraction.
 
-## Technical Stack
+## Pipeline Comparison
 
-| Component       | Technology           | Description |
-|----------------|----------------------|-------------|
-| **UI**         | Gradio               | Web interface for document interaction |
-| **PDF Engine** | PyMuPDF (fitz)       | High-performance PDF processing |
-| **OCR**        | PaddleOCR            | Advanced OCR for tables and scanned content |
-| **Vector DB**  | Qdrant               | High-performance vector database |
-| **Embeddings** | FastEmbed (BGE-Small)| Efficient local text embeddings |
-| **LLM**        | Gemini 2.0 Flash     | Advanced language model for analysis |
+| Feature | Standard Pipeline (`app.py`) | Docling Pipeline (`main.py`) |
+| :--- | :--- | :--- |
+| **Parsing Engine** | PyMuPDF + PaddleOCR | IBM Docling (SOTA Layout Analysis) |
+| **Chunking Strategy** | Context-Aware Sentence Windowing | Hybrid Semantic Chunking |
+| **Table Handling** | Text-based heuristics + Markdown conversion | Structure-aware TableFormer models |
+| **Re-Ranking** | Yes (FlashRank) | No (Relies on Docling's high-quality chunks) |
+| **Speed** | Very Fast | Slower (Heavy ML models for layout) |
+| **Vector Collection** | `imf_policy_reports_final_v4_3` | `docling_financial` |
+| **Best For** | Text-heavy policy docs, huge archives. | Docs with complex columns, headers, & tables. |
 
-## Getting Started
+## Tech Stack
 
-### Prerequisites
+- **Frontend**: Gradio (Async Web UI)
+- **Vector Database**: Qdrant (Cloud or Local Docker)
+- **Embeddings**: FastEmbed (BAAI/bge-small-en-v1.5) - Runs locally on CPU.
+- **LLM / VLM**: Google Gemini 2.0 Flash (Free Tier) - Handles Text & Image reasoning.
+- **Infrastructure**: Fully Async (`asyncio` + `ProcessPoolExecutor`/`ThreadPoolExecutor`).
 
-- Python 3.10 or higher
-- Qdrant (local Docker or cloud instance)
-- Google Gemini API Key (available from [Google AI Studio](https://ai.google.dev/))
+## Prerequisites
 
-### System Dependencies
+- Python 3.10+
+- Google Gemini API Key ([Get it here](https://aistudio.google.com/app/apikey))
+- Qdrant Cluster (Free tier at [cloud.qdrant.io](https://cloud.qdrant.io) or Local Docker)
+- **Windows Users**: Enable "Developer Mode" in Windows Settings (required for Docling model downloads) OR run terminal as Administrator.
 
-For Linux/Ubuntu:
-```bash
-sudo apt-get update && sudo apt-get install -y libgl1-mesa-glx
-```
-
-### Installation
+## Installation
 
 1. **Clone the repository**
+
+2. **Install System Dependencies (Linux only):**
    ```bash
-   git clone https://github.com/yourusername/financial-policy-rag.git
-   cd financial-policy-rag
+   sudo apt-get install libgl1-mesa-glx
    ```
 
-2. **Set up a virtual environment**
+3. **Install Python Dependencies:**
    ```bash
-   python -m venv venv
-   # On Windows:
-   .\venv\Scripts\activate
-   # On Unix or MacOS:
-   source venv/bin/activate
+   pip install pymupdf qdrant-client google-generativeai fastembed paddleocr paddlepaddle opencv-python-headless gradio requests python-dotenv docling flashrank
    ```
 
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-   
-   Or install packages individually:
-   ```bash
-   pip install pymupdf qdrant-client google-generativeai fastembed paddleocr opencv-python-headless pillow gradio requests python-dotenv
-   ```
+## Configuration
 
-4. **Configure environment**
-   Create a `.env` file in the project root with:
-   ```
-   GEMINI_API_KEY=your_gemini_api_key
-   QDRANT_URL=http://localhost:6333  # For local Qdrant
-   # QDRANT_API_KEY=your_cloud_key  # Only for Qdrant Cloud
-   ```
+Create a `.env` file in the root directory:
 
-## Running the Application
+```env
+# Generative AI Key
+GEMINI_API_KEY=your_gemini_key_here
 
-1. **Start Qdrant** (if using locally):
-   ```bash
-   docker run -p 6333:6333 qdrant/qdrant
-   ```
+# Qdrant Vector Database
+QDRANT_URL=https://your-cluster-url.qdrant.io:6333
+QDRANT_API_KEY=your_qdrant_api_key
+```
 
-2. **Launch the application**:
-   ```bash
-   python main.py
-   ```
+## Usage
 
-3. **Access the interface**:
-   - Open a web browser and go to `http://127.0.0.1:7860`
-   - Upload PDFs or enter document URLs
-   - Query the documents using natural language
+### Option 1: Standard Pipeline (Fast & Robust)
 
-## System Architecture
+Use this for quick analysis of long reports where text flow is standard.
 
-The application follows a modular architecture:
+```bash
+python app.py
+```
 
-1. **Document Ingestion**: Processes various document types (PDF, scanned, digital)
-2. **Content Analysis**:
-   - Text extraction and chunking
-   - Table recognition and conversion
-   - Image/Chart analysis using computer vision
-   - OCR for scanned documents
-3. **Vector Database**: Stores document embeddings for efficient retrieval
-4. **Query Processing**:
-   - Converts queries to embeddings
-   - Performs similarity search
-   - Generates context-aware responses
+**Key Features:**
+- Uses **FlashRank** to re-order search results for higher accuracy.
+- Uses **PaddleOCR** for scanned pages.
+- Uses a **Sliding Window** approach (Page 1 Policy Text...) to keep context.
 
-## Supported Document Types
+### Option 2: Docling Pipeline (Layout Master)
 
-- PDF documents (text-based and scanned)
-- Financial statements and reports
-- Policy documents and white papers
-- Research publications
-- Presentation slides
+Use this for documents with complex layouts, multi-column text, or financial tables that standard parsers break.
+
+```bash
+python main.py
+```
+
+**Key Features:**
+- Uses **IBM's Docling models** to understand the visual layout of the PDF.
+- Extracts tables structurally (not just as text).
+- **Hybrid pipeline**: Uses Docling for structure + PyMuPDF for fast image extraction.
+
+## Architecture Overview
+
+```mermaid
+graph TD
+    User[User Upload] --> Router{Select Pipeline}
+    
+    subgraph "Standard Pipeline (app.py)"
+        P1[PyMuPDF] --> Text[Sentence Window Chunking]
+        P1 --> OCR[PaddleOCR (Scans)]
+        P1 --> Img1[Gemini VLM (Charts)]
+        Text & OCR & Img1 --> Embed1[FastEmbed]
+        Embed1 --> Q1[(Qdrant Collection: imf_policy_reports_final_v4_3)]
+        Search1[Vector Search] --> Rank[FlashRank Re-Ranking]
+    end
+    
+    subgraph "Docling Pipeline (main.py)"
+        D1[Docling Converter] --> Layout[Layout & Table Analysis]
+        Layout --> Hybrid[Hybrid Chunking]
+        D1 --> Img2[Gemini VLM (Charts)]
+        Hybrid & Img2 --> Embed2[FastEmbed]
+        Embed2 --> Q2[(Qdrant Collection: docling_financial)]
+    end
+    
+    Router --> P1
+    Router --> D1
+    
+    Rank --> LLM[Gemini Flash Analyst]
+    Q2 --> LLM
+    LLM --> Answer[Final Response]
+```
 
 ## Troubleshooting
 
-### Common Issues
+1. **`OSError: [WinError 1314] A required privilege is not held by the client`**
+   - **Cause**: Docling needs to create symbolic links to cache AI models.
+   - **Fix**: Run your terminal/VS Code as **Administrator** or enable **Developer Mode** in Windows Settings. The code attempts to mitigate this using environment variables (`HF_HUB_DISABLE_SYMLINKS`), but permissions may still be required on some systems.
 
-1. **OCR Dependencies**
-   - Linux: Install system dependencies as shown above
-   - Windows: Install the latest Visual C++ Redistributable
+2. **`SSL: CERTIFICATE_VERIFY_FAILED`**
+   - **Cause**: Corporate firewalls or missing certificates when downloading models from Hugging Face.
+   - **Fix**: Both scripts include automatic patches (`HF_HUB_DISABLE_SSL_VERIFY`) to bypass this. If it persists, check your VPN/Proxy settings.
 
-2. **Qdrant Connection**
-   - Ensure Docker is running for local Qdrant
-   - Verify the Qdrant container is accessible at the specified URL
+3. **`No module named 'paddle'`**
+   - **Cause**: You installed `paddleocr` but missed the engine.
+   - **Fix**: Run `pip install paddlepaddle`.
 
-3. **API Limitations**
-   - Monitor Gemini API usage to prevent rate limiting
-   - Consider batching requests for large document sets
-
-## Contributing
-
-Contributions to improve the project are welcome. Please submit issues and pull requests through the project's GitHub repository.
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Contact
-
-For support or inquiries, please open an issue in the project repository.
+4. **Ingestion hangs or is slow**
+   - **Solution**:
+     - `app.py` uses massive parallelism (OCR + Vision + Text all run concurrently).
+     - `main.py` is heavier. Be patient on the first run as it downloads models (~500MB).
