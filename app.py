@@ -1,5 +1,18 @@
-import asyncio
 import os
+# --- FIX 1: SSL & CONFIGURATION MUST BE FIRST ---
+# Disable SSL Verification to fix "CERTIFICATE_VERIFY_FAILED" errors
+os.environ["HF_HUB_DISABLE_SSL_VERIFY"] = "1"
+os.environ["CURL_CA_BUNDLE"] = ""
+
+import ssl
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
+
+import asyncio
 import io
 import re
 import fitz  # PyMuPDF
@@ -9,7 +22,7 @@ import requests
 import gradio as gr
 import qdrant_client
 import uuid
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -20,8 +33,22 @@ from qdrant_client.models import PointStruct, VectorParams, Distance
 from fastembed import TextEmbedding
 import google.generativeai as genai
 
-# --- VERSION & IMPORT CHECKS ---
-# print(f"🔌 Qdrant Client Version: {qdrant_client.__version__}")
+# --- CONFIGURATION ---
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise ValueError("❌ GEMINI_API_KEY not found in .env file")
+
+COLLECTION_NAME = "imf_policy_reports_final_v4_3" 
+EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+WINDOW_SIZE = 6  
+WINDOW_OVERLAP = 2
+
+genai.configure(api_key=GEMINI_API_KEY)
 
 # Safe Import for PaddleOCR
 PADDLE_AVAILABLE = False
@@ -29,7 +56,6 @@ try:
     import paddle
     from paddleocr import PaddleOCR
     PADDLE_AVAILABLE = True
-    # Suppress Paddle Logs
     import logging
     logging.getLogger("ppocr").setLevel(logging.ERROR)
 except ImportError:
@@ -43,38 +69,15 @@ try:
 except ImportError:
     print("⚠️ Warning: 'flashrank' not found. Re-ranking will be skipped.")
 
-# --- CONFIGURATION ---
-load_dotenv()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-
-if not GEMINI_API_KEY:
-    raise ValueError("❌ GEMINI_API_KEY not found in .env file")
-
-COLLECTION_NAME = "imf_policy_reports_final_v4_2" 
-EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
-
-WINDOW_SIZE = 6  
-WINDOW_OVERLAP = 2
-
-genai.configure(api_key=GEMINI_API_KEY)
-
-# --- 1. HELPER FUNCTIONS ---
+# --- 1. HELPER FUNCTIONS (WORKERS) ---
 
 def _run_paddle_ocr(image_bytes: bytes) -> str:
     """Runs PaddleOCR on an image byte stream."""
     if not PADDLE_AVAILABLE: return ""
     try:
-        # Initialize PaddleOCR
-        # use_angle_cls=False prevents 'cls' argument errors in some versions
         ocr = PaddleOCR(use_angle_cls=False, lang='en', show_log=False) 
-        
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        # Run OCR
         result = ocr.ocr(img, cls=False)
         
         extracted_text = []
@@ -83,7 +86,7 @@ def _run_paddle_ocr(image_bytes: bytes) -> str:
                 if line and len(line) > 1:
                     extracted_text.append(line[1][0])
         return "\n".join(extracted_text)
-    except Exception as e:
+    except Exception:
         return ""
 
 def _create_sentence_window_chunks(text: str, page_num: int) -> List[Dict]:
@@ -122,8 +125,21 @@ def _create_sentence_window_chunks(text: str, page_num: int) -> List[Dict]:
         if i + WINDOW_SIZE >= len(sentences): break
     return chunks
 
+def _find_table_title(blocks, table_bbox, page_height):
+    title = "Unknown Table"
+    min_dist = float('inf')
+    table_y0 = table_bbox[1]
+    for b in blocks:
+        text = b[4].strip()
+        y1 = b[3]
+        if y1 < table_y0:
+            dist = table_y0 - y1
+            if dist < 100 and dist < min_dist and len(text) < 200:
+                min_dist = dist
+                title = text
+    return title
+
 def _cpu_process_page(pdf_path: str, page_num: int) -> Dict[str, Any]:
-    """Processes a page using Table Extraction + Sentence Window Chunking."""
     try:
         doc = fitz.open(pdf_path)
         page = doc.load_page(page_num)
@@ -136,33 +152,34 @@ def _cpu_process_page(pdf_path: str, page_num: int) -> Dict[str, Any]:
             "needs_ocr": False
         }
 
-        # Table Extraction
-        tables = page.find_tables()
+        text_blocks = page.get_text("blocks")
+        tables = page.find_tables(vertical_strategy="text", horizontal_strategy="text")
+        
         if tables.tables:
             for tab in tables:
+                title = _find_table_title(text_blocks, tab.bbox, page.rect.height)
                 md_text = tab.to_markdown()
                 if len(md_text) > 30:
+                    chunk_text = f"TABLE: {title}\n(Source: Page {display_page_num})\n\n{md_text}"
                     result_data["chunks"].append({
-                        "text": f"Table on Page {display_page_num}:\n{md_text}",
+                        "text": chunk_text,
                         "type": "table",
                         "metadata": {
                             "source": "imf_table",
-                            "page_num": display_page_num
+                            "page_num": display_page_num,
+                            "table_title": title
                         }
                     })
                 page.add_redact_annot(tab.bbox)
             page.apply_redactions()
 
-        # Image Extraction
         for img in page.get_images(full=True):
             try:
                 base_image = doc.extract_image(img[0])
                 if len(base_image["image"]) > 5000: 
                     result_data["images"].append(base_image["image"])
-            except:
-                pass
+            except: pass
 
-        # Text Extraction
         text_content = page.get_text()
         if len(text_content) < 50:
             result_data["needs_ocr"] = True
@@ -173,29 +190,25 @@ def _cpu_process_page(pdf_path: str, page_num: int) -> Dict[str, Any]:
         doc.close()
         return result_data
     except Exception as e:
-        print(f"Error Page {page_num}: {e}")
         return {"page_num": page_num + 1, "chunks": [], "images": [], "needs_ocr": False}
 
 # --- 2. ASYNC RAG PIPELINE ---
 
 class AsyncContextRAG:
     def __init__(self):
+        # Lazy initialization of heavier components to avoid multiprocess cloning issues
         self.process_executor = ProcessPoolExecutor(max_workers=os.cpu_count())
-        
-        # FIX 1: Increased Timeout for Qdrant Client to prevent ReadTimeout errors
         self.client = AsyncQdrantClient(
             url=QDRANT_URL, 
             api_key=QDRANT_API_KEY,
-            timeout=60.0  # 60 seconds timeout
+            timeout=60.0
         )
-        
         self.embed_model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
         self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
         
+        self.reranker = None
         if FLASHRANK_AVAILABLE:
             self.reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="./flashrank_cache")
-        else:
-            self.reranker = None
             
         self.query_cache = {}
         self.sem = asyncio.Semaphore(10)
@@ -236,8 +249,7 @@ class AsyncContextRAG:
                 ocr_text = await loop.run_in_executor(self.process_executor, _run_paddle_ocr, page_data["scan_bytes"])
                 if ocr_text:
                     page_data["chunks"].extend(_create_sentence_window_chunks(ocr_text, page_num))
-            except Exception as e:
-                print(f"Page {page_num} OCR Skip: {e}")
+            except Exception: pass
 
         if page_data["images"]:
             img_tasks = [self.analyze_image(b) for b in page_data["images"]]
@@ -246,10 +258,7 @@ class AsyncContextRAG:
                 page_data["chunks"].append({
                     "text": f"Chart/Figure on Page {page_num}: {cap}",
                     "type": "chart", 
-                    "metadata": {
-                        "source": "imf_chart",
-                        "page_num": page_num
-                    }
+                    "metadata": {"source": "imf_chart", "page_num": page_num}
                 })
         return page_data["chunks"]
 
@@ -264,11 +273,9 @@ class AsyncContextRAG:
         progress(0.1, desc=f"Parsing {total_pages} pages...")
         loop = asyncio.get_running_loop()
         
-        # 1. CPU Parsing
         parse_tasks = [loop.run_in_executor(self.process_executor, _cpu_process_page, pdf_path, i) for i in range(total_pages)]
         raw_pages = await asyncio.gather(*parse_tasks)
 
-        # 2. Enrichment
         progress(0.3, desc="Enriching (OCR/Vision)...")
         enrichment_tasks = [self._enrich_page(page) for page in raw_pages]
         all_page_chunks = await asyncio.gather(*enrichment_tasks)
@@ -276,7 +283,6 @@ class AsyncContextRAG:
 
         if not all_chunks: return "⚠️ No content found."
 
-        # 3. Embedding
         progress(0.7, desc=f"Embedding {len(all_chunks)} chunks...")
         texts = [c["text"] for c in all_chunks]
         embeddings = list(self.embed_model.embed(texts))
@@ -285,7 +291,6 @@ class AsyncContextRAG:
         for i, c in enumerate(all_chunks):
             meta = c.get("metadata", {})
             if meta is None: meta = {}
-            
             points.append(PointStruct(
                 id=str(uuid.uuid4()),
                 vector=embeddings[i].tolist(),
@@ -297,24 +302,18 @@ class AsyncContextRAG:
                 }
             ))
 
-        # FIX 2: Reduced Batch Size to 50 (Prevents Timeouts) & Added Retry Logic
         batch_size = 50
-        total_batches = (len(points) + batch_size - 1) // batch_size
-        
         for i in range(0, len(points), batch_size):
             batch = points[i:i+batch_size]
-            progress(0.8 + (0.2 * (i / len(points))), desc=f"Uploading Batch {(i//batch_size)+1}/{total_batches}...")
-            
+            progress(0.8 + (0.2 * (i / len(points))), desc=f"Uploading Batch {(i//batch_size)+1}...")
             retries = 3
             for attempt in range(retries):
                 try:
                     await self.client.upsert(COLLECTION_NAME, batch)
-                    break # Success
+                    break 
                 except Exception as e:
-                    if attempt == retries - 1:
-                        print(f"❌ Batch Upload Failed after {retries} attempts: {e}")
-                    else:
-                        await asyncio.sleep(1) # Wait before retry
+                    if attempt == retries - 1: print(f"Batch Fail: {e}")
+                    else: await asyncio.sleep(1)
             
         return f"✅ Indexed {len(points)} chunks from {total_pages} pages."
 
@@ -342,7 +341,6 @@ class AsyncContextRAG:
 
         if not search_results: return "No data found.", []
 
-        # Re-Rank
         if FLASHRANK_AVAILABLE and self.reranker:
             passages = [{"id": hit.id, "text": hit.payload["text"], "meta": hit.payload} for hit in search_results]
             ranked = self.reranker.rerank(RerankRequest(query=user_query, passages=passages))
@@ -354,9 +352,16 @@ class AsyncContextRAG:
         citations = [f"Page {hit['meta'].get('page','?')}" for hit in top_context]
 
         prompt = f"""
-        Role: Financial Analyst. 
-        Task: Answer using ONLY context.
-        Context: {context_str}
+        Role: Expert Financial Policy Analyst.
+        Task: Answer the question accurately using the provided context.
+        Instructions:
+        1. If the context contains a Table, read the Markdown carefuly. 
+        2. Look for headers like "2024" or "Proj." to align data correctly.
+        3. Quote specific numbers if available.
+        
+        Context:
+        {context_str}
+        
         Question: {user_query}
         """
         
@@ -364,18 +369,29 @@ class AsyncContextRAG:
         self.query_cache[user_query] = (response.text, list(set(citations)))
         return response.text, list(set(citations))
 
-# --- 3. GRADIO UI ---
+# --- 3. GRADIO UI & GLOBAL STATE MANAGEMENT ---
 
-rag_system = AsyncContextRAG()
+# FIX 2: SINGLETON PATTERN FOR MULTIPROCESSING SAFETY
+# We use a global variable but ensure it's only initialized via a function.
+_rag_system_instance = None
+
+def get_rag_system():
+    global _rag_system_instance
+    if _rag_system_instance is None:
+        print("🔄 Initializing RAG System (Lazy Load)...")
+        _rag_system_instance = AsyncContextRAG()
+    return _rag_system_instance
 
 async def check_db_status():
-    exists, count = await rag_system.get_collection_status()
+    sys = get_rag_system()
+    exists, count = await sys.get_collection_status()
     if exists:
         return f"✅ **Knowledge Base Ready**\nCollection: `{COLLECTION_NAME}`\nVectors: {count}"
     else:
         return f"⚠️ **Empty Knowledge Base**\nCollection `{COLLECTION_NAME}` not found.\nPlease ingest a document."
 
 async def handle_ingest(file_obj, url_text):
+    sys = get_rag_system()
     target_path = ""
     if url_text.strip():
         try:
@@ -389,17 +405,19 @@ async def handle_ingest(file_obj, url_text):
     else:
         return "Please upload a file."
     
-    return await rag_system.ingest_document(target_path)
+    return await sys.ingest_document(target_path)
 
 async def chat_Wrapper(msg, hist):
-    ans, cits = await rag_system.query(msg)
+    sys = get_rag_system()
+    ans, cits = await sys.query(msg)
     return f"{ans}\n\n📚 **Sources:** {', '.join(map(str, cits))}" if cits else ans
 
+# --- UI BUILD ---
 with gr.Blocks(title="IMF Analyst RAG") as demo:
     gr.Markdown("# 📈 Financial Policy Analyst RAG")
+    status_display = gr.Markdown("🔄 System Idle...")
     
-    # STATUS BOX
-    status_display = gr.Markdown("🔄 Checking Database...")
+    # Load status on startup
     demo.load(check_db_status, outputs=[status_display])
 
     with gr.Accordion("📂 Add New Documents (Optional)", open=False):
@@ -410,8 +428,8 @@ with gr.Blocks(title="IMF Analyst RAG") as demo:
         out = gr.Textbox(label="Result")
         btn.click(handle_ingest, [f_in, u_in], out)
 
-    # CHAT
     gr.ChatInterface(chat_Wrapper, type="messages")
 
 if __name__ == "__main__":
+    # FIX 3: Ensure multiprocessing works correctly on Windows
     demo.launch()
