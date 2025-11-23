@@ -6,7 +6,7 @@ This repository contains two distinct pipeline implementations optimized for dif
 
 - **app.py (Standard Pipeline)**: Optimized for speed, custom chunking, and re-ranking. Best for text-heavy documents.
 - **main.py (Docling Pipeline)**: Optimized for complex layout parsing, cross-modal retrieval, and high-fidelity table extraction. Best for documents with complex layouts and tables.
-
+Demo video -  https://www.loom.com/share/7c81872491694ec7a4d8d640bd070c79
 ## Pipeline Comparison
 
 | Feature | Standard Pipeline (`app.py`) | Docling Pipeline (`main.py`) |
